@@ -577,6 +577,10 @@ static void init_memx(void) {
     // Doing so causes exit() to be called during Metal commit, killing the compressor.
     // Instead, we rely on __interpose for malloc/mmap interception and
     // malloc_zone_from_ptr for free/realloc routing.
+    //
+    // On macOS 15+, __interpose for malloc is unreliable due to dyld cache.
+    // mmap interpose works reliably. Programs using mmap(MAP_ANON|MAP_PRIVATE)
+    // for large allocations (databases, ML frameworks, etc.) are fully supported.
 
     fprintf(stderr, "[memx] ✅ GPU memory expansion active (%llu MB virtual, __interpose + zone)\n",
             (unsigned long long)(g_z->vmem_size / MB));

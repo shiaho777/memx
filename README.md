@@ -41,13 +41,16 @@ clang -O2 -o memx memx.m -framework Foundation
 
 MemX uses **lazy initialization** — the GPU compressor only starts when a program allocates >64KB:
 
-| Program | Allocates >64KB? | MemX Activates? | Overhead |
-|---------|-------------------|-----------------|----------|
+| Program | Uses mmap for large allocs? | MemX Activates? | Overhead |
+|---------|------------------------------|-----------------|----------|
 | `ls`, `cat`, `echo` | No | No | ~0μs (just constructor) |
-| `python3 script.py` | Maybe | Only if large alloc | ~0μs if not |
-| `./llama-server` | Yes | ✅ Yes | ~50ms one-time init |
+| `python3 script.py` | Rarely | Only if large mmap | ~0μs if not |
+| C/C++ programs using mmap | Yes | ✅ Yes | ~50ms one-time init |
+| Programs using malloc only | No* | No | ~0μs |
 
-This means you can safely set `DYLD_INSERT_LIBRARIES` globally — small programs pay zero cost, memory-heavy programs automatically benefit.
+\* On macOS 15+, `__interpose` for malloc is unreliable due to dyld cache optimizations. mmap interpose works reliably. Programs that allocate large memory via `mmap(MAP_ANON|MAP_PRIVATE)` (databases, LLM engines, etc.) are fully supported.
+
+This means MemX works best for programs that use `mmap` for large allocations — which is the standard pattern for databases, ML frameworks, and memory-intensive servers.
 
 ## Benchmarks (Apple M4 Pro, 24GB)
 
@@ -130,6 +133,7 @@ PAGE_NONE → PAGE_RESIDENT → PAGE_COMPRESSED → PAGE_HOT → PAGE_RESIDENT
 - **Userspace only**: Cannot intercept kernel-allocated memory. Kernel integration would enable system-wide compression.
 - **Incompressible data**: Random/encrypted/already-compressed data is stored raw with zero overhead.
 - **Large allocations only**: Allocations <64KB go through normal malloc (not worth compressing).
+- **malloc interpose unreliable on macOS 15+**: Due to dyld cache optimizations, `__interpose` for `malloc` may not take effect. `mmap` interpose works reliably. Programs using `mmap(MAP_ANON|MAP_PRIVATE)` for large allocations are fully supported.
 
 ## Project Structure
 

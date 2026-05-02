@@ -20,7 +20,7 @@ We present MemX, a system that exploits the GPU as a **memory compression coproc
 
 3. **Predictive prefetching with sequential pattern detection.** We detect sequential page access patterns at fault time and speculatively decompress ahead, achieving 2.5 GB/s sequential throughput with 5.2× speedup over random access—approaching native memory bandwidth.
 
-4. **Comprehensive evaluation** on Apple M4 Pro showing 56–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 18.8× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
+4. **Comprehensive evaluation** on Apple M4 Pro showing 55–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 18.8× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
 
 ## 2. Background and Motivation
 
@@ -202,7 +202,7 @@ MemX consists of ~715 lines of Objective-C with embedded Metal shader strings, c
 
 | Workload | Size | Baseline FP | After MemX | Savings |
 |----------|------|-------------|------------|---------|
-| LLM Weights | 1.5GB | 1761 MB | 781 MB | **56%** |
+| LLM Weights | 1.5GB | 1745 MB | 789 MB | **55%** |
 | Database | 512MB | 753 MB | 249 MB | **67%** |
 | Compile Objects | 512MB | 681 MB | 170 MB | **75%** |
 | Browser Tabs | 1GB | 1257 MB | 1257 MB | 0% |
@@ -230,14 +230,14 @@ We simulate four representative application patterns under MemX:
 
 | Workload | Size | Footprint Reduction | Dedup Hits | Access Latency |
 |----------|------|-------------------|-----------|---------------|
-| LLM Inference | 1.5 GB | **56%** (1761→781 MB) | High | 86 ms / 5% scan |
+| LLM Inference | 1.5 GB | **55%** (1745→789 MB) | High | 79 ms / 5% scan |
 | Database KV Store | 512 MB | **67%** (753→249 MB) | High | 26 ns/op (random) |
 | Compiler Objects | 512 MB | **75%** (681→170 MB) | High | 56 μs/obj (sequential) |
 | Browser Tabs | 1 GB | 0% (random images) | None | N/A |
 
 **Key observations:**
 
-1. **LLM Inference**: 90% near-zero quantized weights compress extremely well (56% reduction). Inference on 5% of model triggers 86ms of decompression — acceptable for batch processing.
+1. **LLM Inference**: 90% near-zero quantized weights compress extremely well (55% reduction). Inference on 5% of model triggers 79ms of decompression — acceptable for batch processing.
 
 2. **Database KV Store**: Repeated record headers enable strong deduplication (125,751 hits). Random lookups at 26 ns/op — decompression is fast enough for database workloads.
 
