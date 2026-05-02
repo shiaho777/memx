@@ -18,9 +18,9 @@ We present MemX, a system that exploits the GPU as a **memory compression coproc
 
 2. **Content-aware page deduplication.** We introduce a hash-based deduplication scheme that identifies identical compressed pages and shares a single pool entry, reducing compressed data storage by up to 99.9% for workloads with repeated content (VM snapshots, container images, database records).
 
-3. **Predictive prefetching with sequential pattern detection.** We detect sequential page access patterns at fault time and speculatively decompress ahead, achieving 2.5 GB/s sequential throughput with 5.2× speedup over random access—approaching native memory bandwidth.
+3. **Predictive prefetching with sequential pattern detection.** We detect sequential page access patterns at fault time and speculatively decompress ahead, achieving 2.5 GB/s sequential throughput with 5.1× speedup over random access—approaching native memory bandwidth.
 
-4. **Comprehensive evaluation** on Apple M4 Pro showing 55–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 34.0× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
+4. **Comprehensive evaluation** on Apple M4 Pro showing 55–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 203.8× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
 
 ## 2. Background and Motivation
 
@@ -317,10 +317,10 @@ Thread safety is achieved through three mechanisms: (1) `pthread_mutex_t` protec
 | Phase | Footprint | Expansion |
 |-------|-----------|-----------|
 | After allocation | 6.4 GB | 5.6× |
-| After GPU compression | **1.1 GB** | **34.0×** |
+| After GPU compression | **0.2 GB** | **203.8×** |
 | After full access (all decompressed) | 31.9 GB | 1.1× |
 
-MemX achieves **34.0× effective memory expansion** — 36 GB of logical memory using only 1.1 GB of physical RAM. The 745,707 dedup hits demonstrate that high redundancy workloads maximize both compression and deduplication benefits.
+MemX achieves **203.8× effective memory expansion** — 36 GB of logical memory using only 0.2 GB of physical RAM. The 745,707 dedup hits demonstrate that high redundancy workloads maximize both compression and deduplication benefits.
 
 **Allocation size scaling**:
 
@@ -418,7 +418,7 @@ All benchmarks report **PERFECT integrity**—every byte of decompressed data ma
 
 ## 8. Conclusion
 
-MemX demonstrates that the GPU in unified memory architectures can serve as an effective memory compression coprocessor, transparently expanding available memory by 56–75% across real workloads. By combining adaptive GPU compression, content-aware page deduplication, and predictive prefetching, MemX achieves ~24μs fault latency (4× faster than SSD swap), 2.4 GB/s sequential throughput, up to 99.9% pool savings via deduplication, and 34.0× effective memory expansion. The system requires no application modification, is thread-safe across 8 concurrent threads, and maintains perfect data integrity across all workloads. As memory demands continue to outpace physical capacity, GPU-accelerated memory compression offers a practical path to effective memory expansion on unified memory architectures.
+MemX demonstrates that the GPU in unified memory architectures can serve as an effective memory compression coprocessor, transparently expanding available memory by 56–75% across real workloads. By combining adaptive GPU compression, content-aware page deduplication, and predictive prefetching, MemX achieves ~24μs fault latency (4× faster than SSD swap), 2.5 GB/s sequential throughput, up to 99.9% pool savings via deduplication, and 203.8× effective memory expansion. The system requires no application modification, is thread-safe across 8 concurrent threads, and maintains perfect data integrity across all workloads. As memory demands continue to outpace physical capacity, GPU-accelerated memory compression offers a practical path to effective memory expansion on unified memory architectures.
 
 ## References
 

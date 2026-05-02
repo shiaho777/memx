@@ -153,6 +153,7 @@ typedef struct {
     uint32_t           *res_list;        // page indices that are PAGE_RESIDENT
     volatile uint32_t   res_count;        // number of entries in res_list
     uint32_t            res_cap;          // capacity of res_list
+    int                 idle_count;       // adaptive sleep counter for compressor
 } MemXZone3;
 
 static MemXZone3 *g_z = NULL;
@@ -396,14 +397,33 @@ static void *bg_compressor(void *arg) {
                     res_list_add(s, i);  // Re-add to list for future rounds
                 }
             }
-            if(nc==0){sleep(1);continue;}
+            if(nc==0){
+                // Adaptive sleep: short when recently active, longer when truly idle
+                if(++s->idle_count > 10) { sleep(1); s->idle_count = 10; }
+                else { struct timespec ts={0,100000000}; nanosleep(&ts,NULL); }
+                continue;
+            }
         }
-        // Copy page data
-        for(size_t i=0;i<nc;i++) memcpy(s->tmp_src+i*PAGE_SZ,(uint8_t*)s->vmem+tc[i]*PAGE_SZ,PAGE_SZ);
+        // Copy page data (bulk memcpy for contiguous runs)
+        for(size_t i=0;i<nc;) {
+            size_t j=i+1;
+            // Find contiguous run starting at tc[i]
+            while(j<nc && tc[j]==tc[j-1]+1) j++;
+            size_t run_pages = j - i;
+            if (run_pages > 1) {
+                // Bulk copy contiguous pages
+                memcpy(s->tmp_src+i*PAGE_SZ, (uint8_t*)s->vmem+tc[i]*PAGE_SZ, run_pages*PAGE_SZ);
+            } else {
+                memcpy(s->tmp_src+i*PAGE_SZ, (uint8_t*)s->vmem+tc[i]*PAGE_SZ, PAGE_SZ);
+            }
+            i = j;
+        }
         // GPU compress
         int gr=0;
         gr=gpu_compress(s,nc);
-        if(gr!=0){sleep(1);continue;}
+        if(gr!=0){ struct timespec ts={0,100000000}; nanosleep(&ts,NULL); continue; }
+        // Reset idle counter - we had work to do
+        s->idle_count = 0;
         for(size_t i=0;i<nc;i++){
             uint32_t cs=s->tmp_sz[i]; size_t pidx=tc[i];
             // Skip incompressible pages (less than 32 bytes savings)
@@ -411,9 +431,14 @@ static void *bg_compressor(void *arg) {
             if(s->pool_next+cs>s->pool_size) continue;
             // ─── Dedup: check if same compressed data already exists ───
             uint8_t *cdata = s->tmp_dst + i*PAGE_SZ;
-            // Hash the compressed data (FNV-1a)
+            // Hash the compressed data (FNV-1a, word-at-a-time for speed)
             uint64_t h = 14695981039346656037ULL;
-            for(uint32_t j=0; j<cs; j++) { h ^= cdata[j]; h *= 1099511628211ULL; }
+            uint32_t j=0;
+            for(; j+7<cs; j+=8) {
+                uint64_t w; memcpy(&w, cdata+j, 8);
+                h ^= w; h *= 1099511628211ULL;
+            }
+            for(; j<cs; j++) { h ^= cdata[j]; h *= 1099511628211ULL; }
             uint32_t slot = (uint32_t)(h & DEDUP_HT_MASK);
             int dedup_found = 0;
             // Open-addressing probe (up to 8 probes)
@@ -442,11 +467,10 @@ static void *bg_compressor(void *arg) {
             if (dedup_found) continue;
             // ─── No dedup hit: store new compressed data ───
             uint64_t off=s->pool_next;
-            // Make pool pages writable as needed
+            // Make pool pages writable as needed (batch mprotect for range)
             size_t pool_page_start = off / PAGE_SZ;
             size_t pool_page_end = (off + cs + PAGE_SZ - 1) / PAGE_SZ;
-            for(size_t pp=pool_page_start; pp<pool_page_end; pp++)
-                mprotect(s->pool + pp*PAGE_SZ, PAGE_SZ, PROT_READ|PROT_WRITE);
+            mprotect(s->pool + pool_page_start*PAGE_SZ, (pool_page_end-pool_page_start)*PAGE_SZ, PROT_READ|PROT_WRITE);
             memcpy(s->pool+off,cdata,cs);  // Only store compressed bytes
             s->pool_next+=cs;
             __sync_fetch_and_add(&s->pool_used,cs);
@@ -621,8 +645,9 @@ static void init_memx(void) {
     g_z->decomp_pipe = [g_z->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dp"] error:&err];
     if (!g_z->comp_pipe || !g_z->decomp_pipe) { munmap(g_z, sizeof(MemXZone3)); g_z = NULL; memx_initing = 0; return; }
     
-    // Pre-allocate persistent GPU + temp buffers (256 pages = 4MB each)
-    g_z->batch_cap = 256;
+    // Pre-allocate persistent GPU + temp buffers (512 pages = 8MB each)
+    // Larger batch = better GPU utilization, fewer dispatches
+    g_z->batch_cap = 512;
     size_t batch_bytes = g_z->batch_cap * PAGE_SZ;
     g_z->gpu_sb = [g_z->device newBufferWithLength:batch_bytes options:MTLResourceStorageModeShared];
     g_z->gpu_db = [g_z->device newBufferWithLength:batch_bytes options:MTLResourceStorageModeShared];
@@ -755,10 +780,57 @@ static void fini_memx(void) {
 // CRITICAL: use volatile static flag (not TLS) for early-safety check,
 // since TLS may not be initialized when dyld calls mmap very early.
 
-// Simple allocation table for mmap-routed allocations (no size header needed)
-#define MMAP_TABLE_MAX 4096
+// Hash-based allocation table for mmap-routed allocations (O(1) lookup)
+#define MMAP_TABLE_MAX 8192
+#define MMAP_HT_MASK 8191
 static struct { void *base; size_t npages; } mmap_table[MMAP_TABLE_MAX];
 static int mmap_table_count = 0;
+
+static inline uint32_t mmap_ht_hash(void *ptr) {
+    uintptr_t k = (uintptr_t)ptr;
+    k = ((k >> 16) ^ k) * 0x45d9f3b;
+    k = ((k >> 16) ^ k) * 0x45d9f3b;
+    k = (k >> 16) ^ k;
+    return (uint32_t)(k & MMAP_HT_MASK);
+}
+
+static inline void mmap_table_insert(void *base, size_t npages) {
+    uint32_t slot = mmap_ht_hash(base);
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t idx = (slot + probe) & MMAP_HT_MASK;
+        if (mmap_table[idx].base == NULL) {
+            mmap_table[idx].base = base;
+            mmap_table[idx].npages = npages;
+            mmap_table_count++;
+            return;
+        }
+    }
+    // Fallback: find any empty slot
+    for (uint32_t idx = 0; idx < MMAP_TABLE_MAX; idx++) {
+        if (mmap_table[idx].base == NULL) {
+            mmap_table[idx].base = base;
+            mmap_table[idx].npages = npages;
+            mmap_table_count++;
+            return;
+        }
+    }
+}
+
+static inline int mmap_table_find_and_remove(void *base, size_t *out_npages) {
+    uint32_t slot = mmap_ht_hash(base);
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t idx = (slot + probe) & MMAP_HT_MASK;
+        if (mmap_table[idx].base == base) {
+            *out_npages = mmap_table[idx].npages;
+            mmap_table[idx].base = NULL;
+            mmap_table[idx].npages = 0;
+            mmap_table_count--;
+            return 1;
+        }
+        if (mmap_table[idx].base == NULL) break;
+    }
+    return 0;
+}
 
 static volatile int mmap_safe = 0;  // Set to 1 after our init completes
 
@@ -782,12 +854,8 @@ static void *memx_mmap(void *addr, size_t length, int prot, int flags, int fd, o
             g_z->vmem_next = (found + npages) * PAGE_SZ;
             for (size_t i=found; i<found+npages; i++) { g_z->meta[i].state = PAGE_RESIDENT; bm_set_used(g_z, i); res_list_add(g_z, i); }
             mprotect(result, npages * PAGE_SZ, PROT_READ|PROT_WRITE);
-            // Record in allocation table
-            if (mmap_table_count < MMAP_TABLE_MAX) {
-                mmap_table[mmap_table_count].base = result;
-                mmap_table[mmap_table_count].npages = npages;
-                mmap_table_count++;
-            }
+            // Record in allocation table (hash-based O(1) lookup)
+            mmap_table_insert(result, npages);
             pthread_mutex_unlock(&g_z->alloc_mutex);
             in_memx = 0;
             return result;
@@ -801,17 +869,11 @@ passthrough:
 
 static int memx_munmap(void *addr, size_t length) {
     if (mmap_safe && g_z && is_ours(addr)) {
-        // Find in mmap allocation table
+        // Find in mmap allocation table (hash-based O(1) lookup)
         size_t npages = 0;
         size_t sp = 0;
-        for (int i=0; i<mmap_table_count; i++) {
-            if (mmap_table[i].base == addr) {
-                npages = mmap_table[i].npages;
-                sp = ((uintptr_t)addr - (uintptr_t)g_z->vmem) / PAGE_SZ;
-                mmap_table[i] = mmap_table[mmap_table_count-1];
-                mmap_table_count--;
-                break;
-            }
+        if (mmap_table_find_and_remove(addr, &npages)) {
+            sp = ((uintptr_t)addr - (uintptr_t)g_z->vmem) / PAGE_SZ;
         }
         // Not in table: might be a memx_malloc allocation (with size header at addr-8)
         if (npages == 0) {
