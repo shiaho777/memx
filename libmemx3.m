@@ -108,7 +108,7 @@ typedef struct {
 
 typedef struct {
     void        *vmem;       uint64_t    vmem_size;   size_t      npages;
-    uint64_t    vmem_next;
+    uint64_t    vmem_next;   // next-fit hint for allocation (page index * PAGE_SZ)
     uint8_t    *pool;        uint64_t    pool_size;   uint64_t    pool_used;
     uint64_t    pool_next;
     pthread_mutex_t alloc_mutex;  // protects vmem_next, pool_next, meta state transitions
@@ -139,13 +139,59 @@ typedef struct {
     volatile uint64_t   prefetch_hits;   // pages that were prefetched before fault
     volatile uint64_t   prefetch_misses; // pages prefetched but never accessed
     volatile uint64_t   prefetch_count;  // total prefetch operations
-    #define PREFETCH_AHEAD 2             // how many pages to prefetch ahead
+    #define PREFETCH_AHEAD 4             // how many pages to prefetch ahead (was 2)
     #define PREFETCH_STRIDE_MIN 1
     #define PREFETCH_STRIDE_MAX 64
+    // Free page bitmap for O(1) allocation instead of linear scan
+    // Each bit = 1 page, 1=free, 0=used. 6M pages = 750KB bitmap.
+    uint64_t           *free_bm;         // [npages/64] rounded up
+    uint32_t            free_bm_size;     // number of uint64_t entries
 } MemXZone3;
 
 static MemXZone3 *g_z = NULL;
 static __thread int in_memx = 0;  // Per-thread recursion guard
+
+// ─── Free bitmap helpers ───
+static inline void bm_set_free(MemXZone3 *s, size_t page) {
+    s->free_bm[page / 64] |= (1ULL << (page % 64));
+}
+static inline void bm_set_used(MemXZone3 *s, size_t page) {
+    s->free_bm[page / 64] &= ~(1ULL << (page % 64));
+}
+static inline int bm_is_free(MemXZone3 *s, size_t page) {
+    return (s->free_bm[page / 64] >> (page % 64)) & 1;
+}
+// Find N consecutive free pages starting from hint. Returns page index or -1.
+// Uses bitmap word-level scan: skip entire 64-page words that are fully used.
+static inline ssize_t bm_find_free_run(MemXZone3 *s, size_t npages, size_t hint) {
+    size_t total = s->npages;
+    // Start from hint, wrap around once
+    for (size_t start = hint; start < total; ) {
+        uint64_t word = s->free_bm[start / 64];
+        // Skip full words quickly
+        if (word == 0) { start = (start / 64 + 1) * 64; continue; }
+        // Check each bit in this word
+        size_t base = start & ~63ULL;
+        for (size_t bit = start - base; bit < 64 && base + bit < total; bit++) {
+            if ((word >> bit) & 1) {
+                // Found a free page, check if we have npages consecutive
+                size_t found = base + bit;
+                size_t cont = 0;
+                for (size_t j = found; j < total && cont < npages; j++) {
+                    if (bm_is_free(s, j)) cont++;
+                    else break;
+                }
+                if (cont >= npages) return (ssize_t)found;
+                // Skip past this failed run
+                start = found + cont + 1;
+                goto next_word;
+            }
+        }
+        start = base + 64;
+        next_word:;
+    }
+    return -1;
+}
 
 // ─── CPU decompressor (signal-safe, stack-efficient) ───
 static void cpu_decompress(const uint8_t *src, uint32_t cs, uint8_t *dst) {
@@ -389,16 +435,14 @@ static void *memx_malloc(size_t size) {
     pthread_mutex_lock(&g_z->alloc_mutex);
     size_t alloc_size = ((size + sizeof(size_t) + PAGE_SZ - 1) / PAGE_SZ) * PAGE_SZ;
     size_t npages = alloc_size / PAGE_SZ;
-    size_t sp = g_z->vmem_next / PAGE_SZ, found=0, cont=0;
-    for (size_t i=sp; i<g_z->npages; i++) {
-        if (g_z->meta[i].state==PAGE_NONE) { if(!cont) found=i; cont++; if(cont>=npages) break; }
-        else cont=0;
-    }
-    if (cont < npages) { pthread_mutex_unlock(&g_z->alloc_mutex); in_memx=0; return real_malloc(size); }
+    size_t hint = g_z->vmem_next / PAGE_SZ;
+    ssize_t found_s = bm_find_free_run(g_z, npages, hint);
+    if (found_s < 0) { pthread_mutex_unlock(&g_z->alloc_mutex); in_memx=0; return real_malloc(size); }
+    size_t found = (size_t)found_s;
     
     void *result = (uint8_t*)g_z->vmem + found * PAGE_SZ;
     g_z->vmem_next = (found + npages) * PAGE_SZ;
-    for (size_t i=found; i<found+npages; i++) g_z->meta[i].state = PAGE_NONE;
+    for (size_t i=found; i<found+npages; i++) { g_z->meta[i].state = PAGE_NONE; bm_set_used(g_z, i); }
     mprotect(result, PAGE_SZ, PROT_READ|PROT_WRITE);
     g_z->meta[found].state = PAGE_RESIDENT;
     memcpy(result, &size, sizeof(size_t));
@@ -423,6 +467,7 @@ static void memx_free(void *ptr) {
         if (g_z->meta[i].state==PAGE_COMPRESSED) mprotect((uint8_t*)g_z->vmem+i*PAGE_SZ, PAGE_SZ, PROT_READ|PROT_WRITE);
         g_z->meta[i].state=PAGE_NONE; g_z->meta[i].comp_size=0;
         mprotect((uint8_t*)g_z->vmem+i*PAGE_SZ, PAGE_SZ, PROT_NONE);
+        bm_set_free(g_z, i);
     }
 }
 
@@ -547,6 +592,13 @@ static void init_memx(void) {
     g_z->meta = (PageMeta*)mmap(NULL, meta_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     if (g_z->meta == MAP_FAILED) { munmap(g_z->pool, g_z->pool_size); munmap(g_z->vmem, g_z->vmem_size); munmap(g_z, sizeof(MemXZone3)); g_z = NULL; memx_initing = 0; return; }
     
+    // Free page bitmap: all pages start as free (1=free, 0=used)
+    g_z->free_bm_size = (g_z->npages + 63) / 64;
+    size_t bm_sz = g_z->free_bm_size * sizeof(uint64_t);
+    g_z->free_bm = (uint64_t*)mmap(NULL, bm_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (g_z->free_bm == MAP_FAILED) { munmap(g_z->meta, meta_sz); munmap(g_z->pool, g_z->pool_size); munmap(g_z->vmem, g_z->vmem_size); munmap(g_z, sizeof(MemXZone3)); g_z = NULL; memx_initing = 0; return; }
+    memset(g_z->free_bm, 0xFF, bm_sz);  // All pages free initially
+    
     // Signal handler with alternate stack (decompressor uses 16KB on stack)
     stack_t ss;
     ss.ss_sp = mmap(NULL, SIGSTKSZ*4, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -610,6 +662,7 @@ static void fini_memx(void) {
     munmap(g_z->vmem, g_z->vmem_size);
     munmap(g_z->pool, g_z->pool_size);
     munmap(g_z->meta, g_z->npages * sizeof(PageMeta));
+    munmap(g_z->free_bm, g_z->free_bm_size * sizeof(uint64_t));
     munmap(g_z->dedup_hash, DEDUP_HT_SIZE*8);
     munmap(g_z->dedup_off, DEDUP_HT_SIZE*8);
     munmap(g_z->dedup_sz, DEDUP_HT_SIZE*4);
@@ -647,15 +700,13 @@ static void *memx_mmap(void *addr, size_t length, int prot, int flags, int fd, o
         in_memx = 1;
         pthread_mutex_lock(&g_z->alloc_mutex);
         size_t npages = (length + PAGE_SZ - 1) / PAGE_SZ;
-        size_t sp = g_z->vmem_next / PAGE_SZ, found=0, cont=0;
-        for (size_t i=sp; i<g_z->npages; i++) {
-            if (g_z->meta[i].state==PAGE_NONE) { if(!cont) found=i; cont++; if(cont>=npages) break; }
-            else cont=0;
-        }
-        if (cont >= npages) {
+        size_t hint = g_z->vmem_next / PAGE_SZ;
+        ssize_t found_s = bm_find_free_run(g_z, npages, hint);
+        if (found_s >= 0) {
+            size_t found = (size_t)found_s;
             void *result = (uint8_t*)g_z->vmem + found * PAGE_SZ;
             g_z->vmem_next = (found + npages) * PAGE_SZ;
-            for (size_t i=found; i<found+npages; i++) g_z->meta[i].state = PAGE_RESIDENT;
+            for (size_t i=found; i<found+npages; i++) { g_z->meta[i].state = PAGE_RESIDENT; bm_set_used(g_z, i); }
             mprotect(result, npages * PAGE_SZ, PROT_READ|PROT_WRITE);
             // Record in allocation table
             if (mmap_table_count < MMAP_TABLE_MAX) {
@@ -703,6 +754,7 @@ static int memx_munmap(void *addr, size_t length) {
                 if (g_z->meta[i].state==PAGE_COMPRESSED) mprotect((uint8_t*)g_z->vmem+i*PAGE_SZ, PAGE_SZ, PROT_READ|PROT_WRITE);
                 g_z->meta[i].state=PAGE_NONE; g_z->meta[i].comp_size=0;
                 mprotect((uint8_t*)g_z->vmem+i*PAGE_SZ, PAGE_SZ, PROT_NONE);
+                bm_set_free(g_z, i);
             }
             return 0;
         }
