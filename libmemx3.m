@@ -725,12 +725,18 @@ __attribute__((constructor)) static void memx_ctor(void) {
     mmap_safe = 1;  // mmap interpose is safe (just passes through until g_z is set)
     
     // On macOS 15+, __interpose for malloc may not work due to dyld cache.
-    // Patch GOT entries (__la_symbol_ptr) in all loaded images as a fallback.
-    // This ensures malloc/free/calloc/realloc are intercepted even when
-    // the compiler generates stub calls (which is the case with -fno-builtin-malloc).
+    // Patch GOT entries (__la_symbol_ptr) in loaded images as a fallback.
+    // Only patch images that have writable GOT pages (main executable + user dylibs).
+    // System dylibs (dyld cache) have read-only GOT pages — skip them.
     {
         uint32_t img_count = _dyld_image_count();
         for (uint32_t img = 0; img < img_count; img++) {
+            const char *img_name = _dyld_get_image_name(img);
+            // Skip system libraries — their GOT pages are read-only (dyld cache)
+            if (strncmp(img_name, "/System/", 8) == 0 || 
+                strncmp(img_name, "/usr/lib/", 9) == 0 ||
+                strncmp(img_name, "/usr/lib/system/", 16) == 0) continue;
+            
             const struct mach_header *hdr = _dyld_get_image_header(img);
             intptr_t slide = _dyld_get_image_vmaddr_slide(img);
             if (hdr->magic != MH_MAGIC_64) continue;
@@ -773,19 +779,22 @@ __attribute__((constructor)) static void memx_ctor(void) {
                         
                         uint64_t **entries = (uint64_t **)(slide + sects[s].addr);
                         uint32_t nentries = sects[s].size / 8;
+                        // Quick check: if first entry is already our function, skip
+                        if (nentries > 0 && entries[0] == (uint64_t *)memx_malloc) continue;
+                        
                         for (uint32_t e = 0; e < nentries; e++) {
                             uint32_t idx = indirect_syms[sects[s].reserved1 + e];
                             if (idx == 0x80000000 || idx == 0x40000000) continue; // ABS/LOCAL
                             const char *name = strtab + syms[idx].n_un.n_strx;
                             
                             // Replace malloc/free/calloc/realloc GOT entries
-                            if (strcmp(name, "_malloc") == 0 && entries[e] != (uint64_t *)memx_malloc) {
+                            if (strcmp(name, "_malloc") == 0) {
                                 entries[e] = (uint64_t *)memx_malloc;
-                            } else if (strcmp(name, "_free") == 0 && entries[e] != (uint64_t *)memx_free) {
+                            } else if (strcmp(name, "_free") == 0) {
                                 entries[e] = (uint64_t *)memx_free;
-                            } else if (strcmp(name, "_calloc") == 0 && entries[e] != (uint64_t *)memx_calloc) {
+                            } else if (strcmp(name, "_calloc") == 0) {
                                 entries[e] = (uint64_t *)memx_calloc;
-                            } else if (strcmp(name, "_realloc") == 0 && entries[e] != (uint64_t *)memx_realloc) {
+                            } else if (strcmp(name, "_realloc") == 0) {
                                 entries[e] = (uint64_t *)memx_realloc;
                             }
                         }
