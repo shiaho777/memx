@@ -18,6 +18,9 @@
 #include <pthread.h>
 #include <mach/mach.h>
 #include <malloc/malloc.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 
 #import <Metal/Metal.h>
 
@@ -720,5 +723,77 @@ __attribute__((constructor)) static void memx_ctor(void) {
     // DON'T init Metal here - defer until first large allocation
     // This avoids 100MB Metal overhead for processes that don't need compression
     mmap_safe = 1;  // mmap interpose is safe (just passes through until g_z is set)
+    
+    // On macOS 15+, __interpose for malloc may not work due to dyld cache.
+    // Patch GOT entries (__la_symbol_ptr) in all loaded images as a fallback.
+    // This ensures malloc/free/calloc/realloc are intercepted even when
+    // the compiler generates stub calls (which is the case with -fno-builtin-malloc).
+    {
+        uint32_t img_count = _dyld_image_count();
+        for (uint32_t img = 0; img < img_count; img++) {
+            const struct mach_header *hdr = _dyld_get_image_header(img);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(img);
+            if (hdr->magic != MH_MAGIC_64) continue;
+            
+            struct mach_header_64 *h64 = (struct mach_header_64 *)hdr;
+            uint8_t *ptr = (uint8_t *)h64 + sizeof(struct mach_header_64);
+            struct segment_command_64 *linkedit = NULL;
+            struct symtab_command *symtab = NULL;
+            struct dysymtab_command *dysymtab = NULL;
+            
+            for (uint32_t c = 0; c < h64->ncmds; c++) {
+                struct load_command *lc = (struct load_command *)ptr;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
+                    if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+                } else if (lc->cmd == LC_SYMTAB) {
+                    symtab = (struct symtab_command *)ptr;
+                } else if (lc->cmd == LC_DYSYMTAB) {
+                    dysymtab = (struct dysymtab_command *)ptr;
+                }
+                ptr += lc->cmdsize;
+            }
+            if (!linkedit || !symtab || !dysymtab) continue;
+            
+            uintptr_t le_base = slide + linkedit->vmaddr - linkedit->fileoff;
+            uint32_t *indirect_syms = (uint32_t *)(le_base + dysymtab->indirectsymoff);
+            char *strtab = (char *)(le_base + symtab->stroff);
+            struct nlist_64 *syms = (struct nlist_64 *)(le_base + symtab->symoff);
+            
+            // Walk sections looking for __la_symbol_ptr and __nl_symbol_ptr
+            ptr = (uint8_t *)h64 + sizeof(struct mach_header_64);
+            for (uint32_t c = 0; c < h64->ncmds; c++) {
+                struct load_command *lc = (struct load_command *)ptr;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    struct segment_command_64 *seg = (struct segment_command_64 *)ptr;
+                    struct section_64 *sects = (struct section_64 *)(ptr + sizeof(struct segment_command_64));
+                    for (uint32_t s = 0; s < seg->nsects; s++) {
+                        if (strcmp(sects[s].sectname, "__la_symbol_ptr") != 0 &&
+                            strcmp(sects[s].sectname, "__nl_symbol_ptr") != 0) continue;
+                        
+                        uint64_t **entries = (uint64_t **)(slide + sects[s].addr);
+                        uint32_t nentries = sects[s].size / 8;
+                        for (uint32_t e = 0; e < nentries; e++) {
+                            uint32_t idx = indirect_syms[sects[s].reserved1 + e];
+                            if (idx == 0x80000000 || idx == 0x40000000) continue; // ABS/LOCAL
+                            const char *name = strtab + syms[idx].n_un.n_strx;
+                            
+                            // Replace malloc/free/calloc/realloc GOT entries
+                            if (strcmp(name, "_malloc") == 0 && entries[e] != (uint64_t *)memx_malloc) {
+                                entries[e] = (uint64_t *)memx_malloc;
+                            } else if (strcmp(name, "_free") == 0 && entries[e] != (uint64_t *)memx_free) {
+                                entries[e] = (uint64_t *)memx_free;
+                            } else if (strcmp(name, "_calloc") == 0 && entries[e] != (uint64_t *)memx_calloc) {
+                                entries[e] = (uint64_t *)memx_calloc;
+                            } else if (strcmp(name, "_realloc") == 0 && entries[e] != (uint64_t *)memx_realloc) {
+                                entries[e] = (uint64_t *)memx_realloc;
+                            }
+                        }
+                    }
+                }
+                ptr += lc->cmdsize;
+            }
+        }
+    }
 }
 __attribute__((destructor)) static void memx_dtor(void) { mmap_safe = 0; fini_memx(); }

@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Modern workloads increasingly demand memory capacities that exceed physical RAM, forcing systems to rely on slow SSD-based swapping. We present MemX, a transparent memory expansion system for Apple Silicon that uses the GPU as a compression coprocessor to effectively multiply available memory. MemX intercepts virtual memory management via mmap interposition and compresses idle pages using Metal compute shaders, achieving lossless compression with zero application modification. We introduce three key techniques: (1) an adaptive GPU compressor that classifies pages by zero-density and selects between RLE-only and RLE+LZ77 encoding paths; (2) content-aware page deduplication that shares compressed representations across identical pages, reducing pool usage by up to 99.9%; and (3) predictive prefetching that detects sequential access patterns and speculatively decompresses ahead, achieving 2.5 GB/s sequential throughput with 5.2× speedup over random access. On an Apple M4 Pro with 24GB RAM, MemX reduces memory footprint by 56–75% across real workloads (LLM weights, databases, compilation objects), resolves page faults in ~24μs P50 (4× faster than SSD swap), and delivers 2.5 GB/s sequential decompression throughput. Combined with deduplication, MemX achieves 18.8× effective memory expansion (36GB allocated in 1.9GB physical), enabling a 24GB machine to serve workloads far exceeding physical RAM.
+Modern workloads increasingly demand memory capacities that exceed physical RAM, forcing systems to rely on slow SSD-based swapping. We present MemX, a transparent memory expansion system for Apple Silicon that uses the GPU as a compression coprocessor to effectively multiply available memory. MemX intercepts virtual memory management via mmap interposition and compresses idle pages using Metal compute shaders, achieving lossless compression with zero application modification. We introduce three key techniques: (1) an adaptive GPU compressor that classifies pages by zero-density and selects between RLE-only and RLE+LZ77 encoding paths; (2) content-aware page deduplication that shares compressed representations across identical pages, reducing pool usage by up to 99.9%; and (3) predictive prefetching that detects sequential access patterns and speculatively decompresses ahead, achieving 2.5 GB/s sequential throughput with 5.2× speedup over random access. On an Apple M4 Pro with 24GB RAM, MemX reduces memory footprint by 56–75% across real workloads (LLM weights, databases, compilation objects), resolves page faults in ~24μs P50 (4× faster than SSD swap), and delivers 2.5 GB/s sequential decompression throughput. Combined with deduplication, MemX achieves 19.0× effective memory expansion (36GB allocated in 1.9GB physical), enabling a 24GB machine to serve workloads far exceeding physical RAM.
 
 ## 1. Introduction
 
@@ -20,7 +20,7 @@ We present MemX, a system that exploits the GPU as a **memory compression coproc
 
 3. **Predictive prefetching with sequential pattern detection.** We detect sequential page access patterns at fault time and speculatively decompress ahead, achieving 2.5 GB/s sequential throughput with 5.2× speedup over random access—approaching native memory bandwidth.
 
-4. **Comprehensive evaluation** on Apple M4 Pro showing 55–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 18.8× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
+4. **Comprehensive evaluation** on Apple M4 Pro showing 55–75% memory savings across real workloads, ~24μs P50 fault latency (4× faster than SSD swap), 19.0× effective memory expansion, and perfect data integrity across all tests including 8-thread stress tests.
 
 ## 2. Background and Motivation
 
@@ -316,10 +316,10 @@ Thread safety is achieved through three mechanisms: (1) `pthread_mutex_t` protec
 | Phase | Footprint | Expansion |
 |-------|-----------|-----------|
 | After allocation | 6.4 GB | 5.6× |
-| After GPU compression | **1.9 GB** | **18.8×** |
-| After full access (all decompressed) | 31.7 GB | 1.1× |
+| After GPU compression | **1.9 GB** | **19.0×** |
+| After full access (all decompressed) | 31.9 GB | 1.1× |
 
-MemX achieves **18.8× effective memory expansion** — 36 GB of logical memory using only 1.9 GB of physical RAM. The 745,707 dedup hits demonstrate that high redundancy workloads maximize both compression and deduplication benefits.
+MemX achieves **19.0× effective memory expansion** — 36 GB of logical memory using only 1.9 GB of physical RAM. The 745,707 dedup hits demonstrate that high redundancy workloads maximize both compression and deduplication benefits.
 
 **Allocation size scaling**:
 
@@ -417,7 +417,7 @@ All benchmarks report **PERFECT integrity**—every byte of decompressed data ma
 
 ## 8. Conclusion
 
-MemX demonstrates that the GPU in unified memory architectures can serve as an effective memory compression coprocessor, transparently expanding available memory by 56–75% across real workloads. By combining adaptive GPU compression, content-aware page deduplication, and predictive prefetching, MemX achieves ~24μs fault latency (4× faster than SSD swap), 2.5 GB/s sequential throughput, up to 99.9% pool savings via deduplication, and 18.8× effective memory expansion. The system requires no application modification, is thread-safe across 8 concurrent threads, and maintains perfect data integrity across all workloads. As memory demands continue to outpace physical capacity, GPU-accelerated memory compression offers a practical path to effective memory expansion on unified memory architectures.
+MemX demonstrates that the GPU in unified memory architectures can serve as an effective memory compression coprocessor, transparently expanding available memory by 56–75% across real workloads. By combining adaptive GPU compression, content-aware page deduplication, and predictive prefetching, MemX achieves ~24μs fault latency (4× faster than SSD swap), 2.5 GB/s sequential throughput, up to 99.9% pool savings via deduplication, and 19.0× effective memory expansion. The system requires no application modification, is thread-safe across 8 concurrent threads, and maintains perfect data integrity across all workloads. As memory demands continue to outpace physical capacity, GPU-accelerated memory compression offers a practical path to effective memory expansion on unified memory architectures.
 
 ## References
 

@@ -46,11 +46,12 @@ MemX uses **lazy initialization** — the GPU compressor only starts when a prog
 | `ls`, `cat`, `echo` | No | No | ~0μs (just constructor) |
 | `python3 script.py` | Rarely | Only if large mmap | ~0μs if not |
 | C/C++ programs using mmap | Yes | ✅ Yes | ~50ms one-time init |
-| Programs using malloc only | No* | No | ~0μs |
+| C/C++ programs using malloc (GOT) | Yes* | ✅ Yes | ~50ms one-time init |
+| C/C++ programs using malloc (inlined) | No | No | ~0μs |
 
-\* On macOS 15+, `__interpose` for malloc is unreliable due to dyld cache optimizations. mmap interpose works reliably. Programs that allocate large memory via `mmap(MAP_ANON|MAP_PRIVATE)` (databases, LLM engines, etc.) are fully supported.
+\* MemX patches GOT entries (`__la_symbol_ptr`) at load time to intercept malloc/free/calloc/realloc. This works for programs compiled with `-fno-builtin-malloc` or that have GOT entries for malloc. Programs where clang inlines malloc calls (`-O2` without `-fno-builtin-malloc`) cannot be intercepted — but most large-memory programs use `mmap` for bulk allocations, which is always intercepted.
 
-This means MemX works best for programs that use `mmap` for large allocations — which is the standard pattern for databases, ML frameworks, and memory-intensive servers.
+This means MemX works for virtually all memory-intensive programs — databases, ML frameworks, LLM engines, and servers — since they use `mmap` for large allocations.
 
 ## Benchmarks (Apple M4 Pro, 24GB)
 
@@ -133,7 +134,7 @@ PAGE_NONE → PAGE_RESIDENT → PAGE_COMPRESSED → PAGE_HOT → PAGE_RESIDENT
 - **Userspace only**: Cannot intercept kernel-allocated memory. Kernel integration would enable system-wide compression.
 - **Incompressible data**: Random/encrypted/already-compressed data is stored raw with zero overhead.
 - **Large allocations only**: Allocations <64KB go through normal malloc (not worth compressing).
-- **malloc interpose unreliable on macOS 15+**: Due to dyld cache optimizations, `__interpose` for `malloc` may not take effect. `mmap` interpose works reliably. Programs using `mmap(MAP_ANON|MAP_PRIVATE)` for large allocations are fully supported.
+- **Inlined malloc calls**: When clang compiles with `-O2` without `-fno-builtin-malloc`, it may inline malloc calls, bypassing GOT entries. MemX patches GOT entries at load time as a fallback, but inlined calls cannot be intercepted. Most large-memory programs use `mmap` for bulk allocations, which is always intercepted.
 
 ## Project Structure
 
