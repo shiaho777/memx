@@ -427,10 +427,12 @@ static void memx_free(void *ptr) {
 }
 
 static void *memx_calloc(size_t nmemb, size_t size) {
-    if (in_memx || !g_z || !g_z->running) {
+    size_t total = nmemb * size;
+    // Lazy init: start Metal only when first large allocation occurs
+    if (!g_z && total >= LARGE_THRESHOLD && !in_memx) init_memx();
+    if (in_memx || !g_z || !g_z->running || total < LARGE_THRESHOLD) {
         return real_calloc(nmemb, size);
     }
-    size_t total = nmemb * size;
     void *ptr = memx_malloc(total);
     if (ptr && is_ours(ptr)) { /* pages zero-filled on fault */ }
     else if (ptr) memset(ptr, 0, total);
