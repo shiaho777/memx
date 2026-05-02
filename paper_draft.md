@@ -69,10 +69,11 @@ MemX exploits both intra-page redundancy (via compression) and inter-page redund
 
 ### 3.1 System Overview
 
-MemX operates as a dynamically-loaded library (dylib) via `DYLD_INSERT_LIBRARIES`. It intercepts memory allocation through two mechanisms:
+MemX operates as a dynamically-loaded library (dylib) via `DYLD_INSERT_LIBRARIES`. It intercepts memory allocation through three mechanisms:
 
 1. **`__interpose` section**: Hooks `malloc`, `free`, `calloc`, `realloc`, `mmap`, `munmap` to route large allocations (>64KB) to a managed virtual memory pool
-2. **Registered malloc zone**: Provides `size()` method for `malloc_size()` compatibility
+2. **GOT patching**: At dylib load time, patches `__la_symbol_ptr` entries for malloc/free/calloc/realloc in all non-system images, ensuring interception even when dyld cache bypasses `__interpose`
+3. **Registered malloc zone**: Provides `size()` method for `malloc_size()` compatibility
 
 The managed pool consists of:
 - **Virtual memory region**: Pre-allocated via `mmap(MAP_NORESERVE)`, 4× physical RAM
@@ -156,7 +157,7 @@ The `in_memx` thread-local flag prevents Metal API internal allocations from rou
 
 MemX must be safe under concurrent access from multiple application threads. We identify three categories of shared state and apply appropriate synchronization:
 
-**1. Allocation paths (mutex-protected).** `memx_malloc` and `memx_mmap` scan for contiguous free pages and update `vmem_next`. Without synchronization, two threads could discover the same free region and allocate overlapping pages, causing data corruption. We protect these paths with a `pthread_mutex_t`, which is safe because allocation is not on the critical fault path.
+**1. Allocation paths (mutex-protected).** `memx_malloc` and `memx_mmap` use a free page bitmap to find contiguous free regions. Each bit represents one page (1=free, 0=used), enabling 64-page word-level skips during allocation search. A next-fit hint (`vmem_next`) avoids re-scanning from the beginning. We protect these paths with a `pthread_mutex_t`, which is safe because allocation is not on the critical fault path.
 
 **2. Page state transitions (lock-free CAS).** The fault handler and background compressor concurrently modify page states. We use `__sync_val_compare_and_swap` (CAS) for all state transitions:
 - `PAGE_NONE → PAGE_RESIDENT`: First fault on an uninitialized page
@@ -343,8 +344,8 @@ We evaluate the individual contribution of each MemX technique using a controlle
 | No compression | 1175 MB | 0% | — | — |
 | Compression only | ~430 MB | ~64% | ~24 μs | 475 MB/s |
 | + Deduplication | ~402 MB | +7% pool | ~24 μs | 475 MB/s |
-| + Prefetch (k=2) | ~402 MB | 0% | **6.3 μs** | **2472 MB/s** |
-| + Adaptive class. | ~402 MB | 0% | 6.3 μs | 2472 MB/s |
+| + Prefetch (k=4) | ~402 MB | 0% | **6.4 μs** | **2425 MB/s** |
+| + Adaptive class. | ~402 MB | 0% | 6.4 μs | 2425 MB/s |
 
 **Key findings:**
 
@@ -352,7 +353,7 @@ We evaluate the individual contribution of each MemX technique using a controlle
 
 2. **Deduplication** adds 7% pool savings for this workload (24.6 MB). The benefit scales with content redundancy: 99.9% pool savings for all-zero pages, 0% for all-unique pages. For VM/container workloads with high page sharing, dedup contribution can exceed 50%.
 
-3. **Prefetching** provides no memory savings but reduces sequential latency by 74% (~24μs → 6.3μs) and increases throughput by 5.2× (475 → 2472 MB/s). The 5.2× speedup over random access demonstrates effective sequential pattern detection.
+3. **Prefetching** provides no memory savings but reduces sequential latency by 73% (~24μs → 6.4μs) and increases throughput by 5.1× (475 → 2425 MB/s). The 5.1× speedup over random access demonstrates effective sequential pattern detection. Increasing prefetch depth from k=2 to k=4 improves throughput for long sequential runs.
 
 4. **Adaptive classification** provides no compression ratio improvement (same encoding output) but improves compression throughput by ~30% for zero-heavy pages by skipping the LZ77 hash table lookups.
 
