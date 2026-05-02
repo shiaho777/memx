@@ -146,10 +146,25 @@ typedef struct {
     // Each bit = 1 page, 1=free, 0=used. 6M pages = 750KB bitmap.
     uint64_t           *free_bm;         // [npages/64] rounded up
     uint32_t            free_bm_size;     // number of uint64_t entries
+    // Active page tracking: compact lists for compressor (avoid scanning all 6M pages)
+    uint32_t           *hot_list;        // page indices that are PAGE_HOT
+    volatile uint32_t   hot_count;        // number of entries in hot_list
+    uint32_t            hot_cap;          // capacity of hot_list
+    uint32_t           *res_list;        // page indices that are PAGE_RESIDENT
+    volatile uint32_t   res_count;        // number of entries in res_list
+    uint32_t            res_cap;          // capacity of res_list
 } MemXZone3;
 
 static MemXZone3 *g_z = NULL;
 static __thread int in_memx = 0;  // Per-thread recursion guard
+
+// ─── Active page list helpers ───
+static inline void hot_list_add(MemXZone3 *s, uint32_t page) {
+    if (s->hot_count < s->hot_cap) s->hot_list[s->hot_count++] = page;
+}
+static inline void res_list_add(MemXZone3 *s, uint32_t page) {
+    if (s->res_count < s->res_cap) s->res_list[s->res_count++] = page;
+}
 
 // ─── Free bitmap helpers ───
 static inline void bm_set_free(MemXZone3 *s, size_t page) {
@@ -263,7 +278,7 @@ static void fault_handler(int sig, siginfo_t *info, void *ctx) {
     mprotect(pa,PAGE_SZ,PROT_READ|PROT_WRITE);
     if(m->state==PAGE_NONE){
         uint8_t old = __sync_val_compare_and_swap(&m->state, PAGE_NONE, PAGE_RESIDENT);
-        if(old == PAGE_NONE) memset(pa,0,PAGE_SZ);
+        if(old == PAGE_NONE) { memset(pa,0,PAGE_SZ); res_list_add(g_z, pi); }
     }
     else if(m->state==PAGE_COMPRESSED){
         // Atomic CAS: only one thread wins the race to decompress this page
@@ -273,6 +288,7 @@ static void fault_handler(int sig, siginfo_t *info, void *ctx) {
             uint64_t d_off=m->pool_offset; uint32_t d_sz=m->comp_size;
             cpu_decompress(g_z->pool+d_off,d_sz,pa);m->comp_size=0;m->prefetched=0;m->cooldown=2;
             dedup_decref(g_z,d_off,d_sz);
+            hot_list_add(g_z, pi);
         }
         // else: another thread already decompressed it, data is ready
     }
@@ -299,6 +315,7 @@ static void fault_handler(int sig, siginfo_t *info, void *ctx) {
                     cpu_decompress(g_z->pool+d_off, d_sz, npa);
                     nm->comp_size = 0; nm->prefetched = 1; nm->cooldown = 5;
                     dedup_decref(g_z, d_off, d_sz);
+                    hot_list_add(g_z, pi+k);
                     pf++;
                 }
             }
@@ -318,22 +335,69 @@ static void *bg_compressor(void *arg) {
     in_memx = 1;  // CRITICAL: prevent Metal internal mallocs from going to our pool
     const size_t BATCH=s->batch_cap;
     while(s->running){
-        // Cooldown: decrement counters, transition HOT→RESIDENT only when cooldown=0
-        for(size_t i=0;i<s->npages;i++) {
-            if(s->meta[i].state==PAGE_HOT) {
-                if(s->meta[i].cooldown > 0) {
-                    s->meta[i].cooldown--;
+        // Cooldown: only scan HOT pages from compact list (not all 6M pages)
+        uint32_t hc = s->hot_count;
+        uint32_t new_hot = 0;
+        for(uint32_t i=0; i<hc; i++) {
+            uint32_t pi = s->hot_list[i];
+            if(s->meta[pi].state==PAGE_HOT) {
+                if(s->meta[pi].cooldown > 0) {
+                    s->meta[pi].cooldown--;
+                    // Still hot, keep in list
+                    if (new_hot != i) s->hot_list[new_hot] = pi;
+                    new_hot++;
                 } else {
                     // Atomic CAS: only transition if still HOT (not re-faulted)
-                    uint8_t old = __sync_val_compare_and_swap(&s->meta[i].state, PAGE_HOT, PAGE_RESIDENT);
-                    if(old == PAGE_HOT) s->meta[i].prefetched=0;
+                    uint8_t old = __sync_val_compare_and_swap(&s->meta[pi].state, PAGE_HOT, PAGE_RESIDENT);
+                    if(old == PAGE_HOT) {
+                        s->meta[pi].prefetched=0;
+                        res_list_add(s, pi);  // Transitioned to RESIDENT, add to compress list
+                    } else {
+                        // Re-faulted, keep in hot list
+                        if (new_hot != i) s->hot_list[new_hot] = pi;
+                        new_hot++;
+                    }
                 }
             }
+            // else: page was freed or transitioned by fault handler, drop from list
         }
+        s->hot_count = new_hot;
+        
+        // Collect RESIDENT pages from compact list (not full scan)
         size_t tc[BATCH]; size_t nc=0;
-        for(size_t i=0;i<s->npages&&nc<BATCH&&s->running;i++)
-            if(s->meta[i].state==PAGE_RESIDENT) tc[nc++]=i;
-        if(nc==0){sleep(1);continue;}
+        uint32_t rc = s->res_count;
+        uint32_t new_res = 0;
+        for(uint32_t i=0; i<rc && nc<BATCH && s->running; i++) {
+            uint32_t pi = s->res_list[i];
+            if(s->meta[pi].state==PAGE_RESIDENT) {
+                tc[nc++] = pi;
+                // Keep in list for next round (will be removed when compressed or freed)
+                if (new_res != i) s->res_list[new_res] = pi;
+                new_res++;
+            }
+            // else: page was faulted (→HOT) or freed (→NONE), drop from list
+        }
+        // Compact remaining entries
+        for(uint32_t i=new_res; rc > BATCH && i<rc; i++) {
+            uint32_t pi = s->res_list[i];
+            if(s->meta[pi].state==PAGE_RESIDENT) {
+                s->res_list[new_res++] = pi;
+            }
+        }
+        s->res_count = new_res;
+        
+        if(nc==0){
+            // Fallback: if res_list is empty but there may be untracked RESIDENT pages
+            // (e.g. pages allocated before list was populated, or list overflow)
+            // Do a bitmap-guided scan of used pages
+            for(size_t i=0;i<s->npages&&nc<BATCH&&s->running;i++){
+                if(!bm_is_free(s,i) && s->meta[i].state==PAGE_RESIDENT) {
+                    tc[nc++]=i;
+                    res_list_add(s, i);  // Re-add to list for future rounds
+                }
+            }
+            if(nc==0){sleep(1);continue;}
+        }
         // Copy page data
         for(size_t i=0;i<nc;i++) memcpy(s->tmp_src+i*PAGE_SZ,(uint8_t*)s->vmem+tc[i]*PAGE_SZ,PAGE_SZ);
         // GPU compress
@@ -446,6 +510,7 @@ static void *memx_malloc(size_t size) {
     mprotect(result, PAGE_SZ, PROT_READ|PROT_WRITE);
     g_z->meta[found].state = PAGE_RESIDENT;
     memcpy(result, &size, sizeof(size_t));
+    res_list_add(g_z, found);
     pthread_mutex_unlock(&g_z->alloc_mutex);
     
     in_memx = 0;
@@ -574,7 +639,14 @@ static void init_memx(void) {
     memset(g_z->dedup_hash, 0, DEDUP_HT_SIZE*8);
     memset(g_z->dedup_ref, 0, DEDUP_HT_SIZE*4);
     memset(g_z->dedup_rev, 0xFF, DEDUP_REV_SIZE*4);  // 0xFFFFFFFF = invalid slot
-    if (!g_z->gpu_sb||!g_z->gpu_db||!g_z->gpu_zb||!g_z->tmp_src||!g_z->tmp_dst||!g_z->tmp_sz||!g_z->dedup_hash) {
+    // Active page tracking lists (compact: only track active pages, not all 6M)
+    g_z->hot_cap = 131072;   // max HOT pages tracked (512KB)
+    g_z->res_cap = 1048576;  // max RESIDENT pages tracked (4MB, covers 4GB of pages)
+    g_z->hot_list = (uint32_t*)mmap(NULL, g_z->hot_cap * 4, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    g_z->res_list = (uint32_t*)mmap(NULL, g_z->res_cap * 4, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    g_z->hot_count = 0;
+    g_z->res_count = 0;
+    if (!g_z->gpu_sb||!g_z->gpu_db||!g_z->gpu_zb||!g_z->tmp_src||!g_z->tmp_dst||!g_z->tmp_sz||!g_z->dedup_hash||!g_z->hot_list||!g_z->res_list) {
         munmap(g_z, sizeof(MemXZone3)); g_z = NULL; memx_initing = 0; return;
     }
     
@@ -663,6 +735,8 @@ static void fini_memx(void) {
     munmap(g_z->pool, g_z->pool_size);
     munmap(g_z->meta, g_z->npages * sizeof(PageMeta));
     munmap(g_z->free_bm, g_z->free_bm_size * sizeof(uint64_t));
+    munmap(g_z->hot_list, g_z->hot_cap * 4);
+    munmap(g_z->res_list, g_z->res_cap * 4);
     munmap(g_z->dedup_hash, DEDUP_HT_SIZE*8);
     munmap(g_z->dedup_off, DEDUP_HT_SIZE*8);
     munmap(g_z->dedup_sz, DEDUP_HT_SIZE*4);
@@ -706,7 +780,7 @@ static void *memx_mmap(void *addr, size_t length, int prot, int flags, int fd, o
             size_t found = (size_t)found_s;
             void *result = (uint8_t*)g_z->vmem + found * PAGE_SZ;
             g_z->vmem_next = (found + npages) * PAGE_SZ;
-            for (size_t i=found; i<found+npages; i++) { g_z->meta[i].state = PAGE_RESIDENT; bm_set_used(g_z, i); }
+            for (size_t i=found; i<found+npages; i++) { g_z->meta[i].state = PAGE_RESIDENT; bm_set_used(g_z, i); res_list_add(g_z, i); }
             mprotect(result, npages * PAGE_SZ, PROT_READ|PROT_WRITE);
             // Record in allocation table
             if (mmap_table_count < MMAP_TABLE_MAX) {

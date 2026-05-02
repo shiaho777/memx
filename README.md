@@ -1,6 +1,6 @@
 # MemX — GPU-Accelerated Transparent Memory Compression for Apple Silicon
 
-> **18.8× effective memory expansion** on a 24GB Mac — run workloads that need 450GB of memory.
+> **34.0× effective memory expansion** on a 24GB Mac — run workloads that need 816GB of memory.
 
 MemX uses the GPU as a memory compression coprocessor. It intercepts your program's memory allocations, compresses idle pages on the GPU, and decompresses them on-demand when accessed — **transparently, with zero code changes**.
 
