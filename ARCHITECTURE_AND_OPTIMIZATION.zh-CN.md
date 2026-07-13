@@ -1,232 +1,157 @@
 # MemX 架构与优化
 
-MemX 是面向 Apple Silicon 的可嵌入压缩内存运行时。宿主把大块缓冲显式放进托管虚拟池；冷页压缩，按需 fault 回填，并通过流式工作集编排驻留窗口。LLM 托管目标是：**保持原始精度 bitexact**，同时把进程 RSS 压到远低于模型原始体积。
+说明 MemX 的分层、LLM 驻留编排方式，以及内存与速度的评估方法。英文版：[ARCHITECTURE_AND_OPTIMIZATION.md](ARCHITECTURE_AND_OPTIMIZATION.md)。
 
-English version: [ARCHITECTURE_AND_OPTIMIZATION.md](ARCHITECTURE_AND_OPTIMIZATION.md)
+## 问题
 
-## 设计论点
+本地 LLM 与其它大块进程内缓存需要在控制 RSS 的同时保留大量张量。量化改精度，mmap 交给 OS page cache，offload 框架把张量搬到磁盘或其它设备——这些路径都成立。MemX 切的是另一条：在**进程私有匿名内存**里保留原始精度张量，冷页压缩，计算时只流式驻留一小段 working set。
 
-主流 LLM 内存方案通常只走三条路之一：
+FullHost 正确性门槛：解压必须还原宿主写入的字节；Qwen3.5-0.8B FullHost 以 output sum **`-24.360558`** 作为 bitexact 门禁。
 
-1. **量化**：用更少比特表示权重（llama.cpp / GGUF、AWQ、GPTQ、bitsandbytes）。
-2. **磁盘映射**：依赖 OS page cache / demand paging（GGUF 或 safetensors 的 mmap）。
-3. **卸载**：把张量调度到 CPU / NVMe（FlexGen、DeepSpeed ZeRO-Inference）。
-
-MemX 走第四条路：
-
-**在进程私有匿名内存里保留原始张量字节（bitexact），再压缩，并只流式驻留当前工作集。**
-
-同一台机器上可以出现巨大的 RSS 差距，且数值结果不变——fault / 解压后，宿主看到的仍是精确的 BF16 / FP16 / FP32 字节。
-
-## 系统分层
+## 分层
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│ Host（C / Python / Torch）                                  │
-│  - 显式 context / quota / tensor 描述符                     │
-│  - epoch + working-set 意图（HOT / PREFETCH / RETIRE）      │
-│  - 可选 FullHost demo：run_qwen.py                          │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ memx_runtime.h / memx_runtime.py
-┌───────────────────────────▼─────────────────────────────────┐
-│ Runtime 控制面                                              │
-│  - 命名 context 与配额                                      │
-│  - tensor role / dtype / layout / flags                     │
-│  - 驻留编排器（epochs、WS tracks、pressure）                │
-│  - 遥测（pool pressure、codec 节省、fault）                 │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────────┐
-│ 页状态机                                                    │
-│  PAGE_NONE → PAGE_RESIDENT → PAGE_COMPRESSING               │
-│            → PAGE_COMPRESSED → PAGE_HOT / fault 回填        │
-│  write_seq + dirty 中止、CAS 提交、内容校验                 │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────────┐
-│ 压缩 + 虚拟池                                               │
-│  - Metal 辅助压缩路径                                       │
-│  - tensor 编解码：FP16/BF16 split、delta-split、bitplane、  │
-│    sparse-byte、exp-pack、zlib 混合                         │
-│  - 压缩存储 + free-extent 回收                              │
-│  - 信号驱动解压到 TLS scratch / 映射页                      │
-└─────────────────────────────────────────────────────────────┘
+Host（C / Python / Torch）
+  显式 context、配额、tensor 描述符
+  epoch + WS 意图（HOT / PREFETCH / RETIRE）
+  FullHost 参考：run_qwen.py
+        │
+        ▼  memx_runtime.h / memx_runtime.py
+控制面
+  context、tensor 策略、驻留编排、遥测
+        │
+        ▼
+页状态机
+  RESIDENT → COMPRESSING → COMPRESSED → fault / HOT
+  write_seq、dirty 中止、CAS 提交、整页内容校验
+        │
+        ▼
+压缩虚拟池
+  Metal 辅助压缩、tensor codec、free-extent 回收
+  信号驱动解压（TLS scratch / 映射页）
 ```
 
-## 核心运行时接口
+对应源码：
 
-公开头文件：`include/memx_runtime.h`  
-实现：`libmemx3.m`  
-Python 绑定：`python/memx_runtime.py`
+| 部分 | 路径 |
+|------|------|
+| 公开 API | `include/memx_runtime.h` |
+| 实现 | `libmemx3.m` |
+| Python | `python/memx_runtime.py` |
+| FullHost | `run_qwen.py` |
 
-### 分配与策略
+## 分配与张量策略
 
-- Context 创建 / 销毁 / 配额
-- 托管 `malloc` / `calloc` / `realloc` / `posix_memalign` / `mmap`
-- 通过 `memx_runtime_tensor_desc_t` 做张量语义分配
-- 区间 flag 更新、prefetch、mark-access
-- Seal / force-compress / purge
-- Pressure 与 per-context 统计
+Context 持有托管分配与配额。宿主通过 `malloc` / `mmap` 或 `malloc_tensor` + `memx_runtime_tensor_desc_t`（role、dtype、layout、flags、shape）分配。描述符只影响 codec 候选与驻留策略，不改写张量内容。
 
-Tensor 描述符只是元数据。它们不会量化，也不会改写模型数据。它们按角色（weight、KV cache、activation、embedding、temporary）选择 codec 候选与驻留策略。
+区间 API 覆盖 flag 更新、prefetch、mark-access、seal、force-compress、purge。统计项包括 pool pressure、碎片、codec 节省、fault、以及 per-context 用量。
 
-### 页生命周期保证
+## 页生命周期（正确性）
 
-关键正确性约束：
+压缩路径：
 
-1. 压缩提交时先在 `PAGE_COMPRESSING` 下写 meta，再 CAS 到 `PAGE_COMPRESSED`。
-2. `write_seq` + 写后 dirty 中止，防止撕裂提交。
-3. `page_compress_content_ok` 在接受压缩结果前做整页内容比对。
-4. 对空闲 LLM 页谨慎 WRITE-protect；顺序 dirty hold 避免 thrash。
-5. 解压走 TLS scratch；Darwin 上 free 后改写前用 `MADV_FREE_REUSE`。
-6. Race 压力测试（`test_compressing_race`）必须保持通过。
-7. FullHost 0.8B bitexact 门禁：**Output sum = -24.360558**。
-8. Final 路径不要用 `reseal_weights()` 做粗暴整包重托管。
-9. matmul 热路径禁止 `seal_flush`。
-10. Col-strip 下一块只做 prefetch；冷却当前 strip 时不要把整窗重新 pin 热。
+1. 进入 `PAGE_COMPRESSING`，写入压缩 meta。
+2. 仅在内容仍匹配时 CAS 到 `PAGE_COMPRESSED`（`page_compress_content_ok`，整页比对）。
+3. 写后 dirty / `write_seq` 变化则中止提交。
 
-## 驻留编排器（Residency Orchestrator）
+解压走 TLS scratch。Darwin 上 free 后改写前使用 `MADV_FREE_REUSE`。空闲 LLM 页可谨慎 WRITE-protect；顺序 dirty hold 降低 thrash。Race 覆盖见 `test_compressing_race`。
 
-编排器把“压缩池”升级成“LLM 流式驻留”。
+FullHost 相关操作约束：
+
+- matmul 内不做 `seal_flush`。
+- Final 路径不用 `reseal_weights()` 做整包粗暴 reseal。
+- 下一块 col-strip 只 prefetch；冷却当前 strip 时不要把整窗重新 pin 热。
+
+## 驻留编排器
+
+编排器把压缩池变成可流式推进的 LLM working set。
 
 ### Epoch
 
-| 阶段 | 常量 | 意图 |
+| 阶段 | 常量 | 作用 |
 |------|------|------|
 | Load | `MEMX_EPOCH_LOAD` | 托管张量，允许初始压缩 |
-| Compress | `MEMX_EPOCH_COMPRESS` | 后台 seal / pressure reclaim |
-| Infer | `MEMX_EPOCH_INFER` | 限制 hot budget，流式推进 WS |
-| Final | `MEMX_EPOCH_FINAL` | 回收 tracks，final seal / purge |
+| Compress | `MEMX_EPOCH_COMPRESS` | 后台 seal / 压力回收 |
+| Infer | `MEMX_EPOCH_INFER` | 限制 hot budget，推进窗口 |
+| Final | `MEMX_EPOCH_FINAL` | 回收 tracks，终端 seal / purge |
 
-API：
+```c
+memx_runtime_context_begin_epoch(ctx, phase, hot_budget_bytes);
+memx_runtime_context_apply_ws(ctx, intents, n);
+memx_runtime_context_ws_advance(ctx, ptr, hot_off, hot_len, prefetch_len, flags);
+memx_runtime_context_ws_close(ctx, ptr, flags);
+memx_runtime_context_end_epoch(ctx, seal_tracked);
+```
 
-- `memx_runtime_context_begin_epoch(ctx, phase, hot_budget_bytes)`
-- `memx_runtime_context_apply_ws(ctx, intents, n)`
-- `memx_runtime_context_ws_advance(ctx, ptr, hot_off, hot_len, prefetch_len, flags)`
-- `memx_runtime_context_ws_close(ctx, ptr, flags)`
-- `memx_runtime_context_end_epoch(ctx, seal_tracked)`
+### 意图 flag
 
-### Working-set 意图
-
-`memx_runtime_ws_intent_t` 携带：
-
-- pointer + offset + length
-- 可选 prefetch length
-- priority
-- flags：
-
-| Flag | 含义 |
+| Flag | 行为 |
 |------|------|
 | `MEMX_WS_FLAG_HOT` | 为计算保持区间驻留 |
-| `MEMX_WS_FLAG_PREFETCH` | 提前提前 fault，但不永久扩大 durable hot set |
-| `MEMX_WS_FLAG_RETIRE` | 标记 trail 为冷；策略允许时异步 seal |
+| `MEMX_WS_FLAG_PREFETCH` | 预热后续区间，不扩大 durable hot set |
+| `MEMX_WS_FLAG_RETIRE` | trail 标冷；策略允许时异步 seal |
 | `MEMX_WS_FLAG_RETIRE_SYNC` | 同步 seal trail |
-| `MEMX_WS_FLAG_MARK_ACCESS` | 只做访问记账，不做完整 pin 语义 |
+| `MEMX_WS_FLAG_MARK_ACCESS` | 只记账，不做完整 pin |
 | `MEMX_WS_FLAG_NO_ASYNC` | 强制同步路径 |
 
-Context 跟踪有限数量的 working-set 窗口。已覆盖且 flag 相同的区间走 skip 快路径，避免 syscall 抖动。Prefetch 预算受 pressure 约束，并与 hot 驻留增长分离。Lazy trail release 默认只 cold-mark；只有 RETIRE / trail-seal 策略要求时才 seal。
+每个 context 跟踪有限数量的窗口。已覆盖且 flag 不变的区间跳过重复工作。Prefetch 上限跟 pool pressure 走，并与 hot 增长分离。Trail 默认 cold-mark；只有 RETIRE / trail-seal 策略要求时才 seal。
 
-### 宿主接入模式（FullHost）
+### FullHost 流程（`run_qwen.py`，`MEMX_WS_ORCH=1`）
 
-`run_qwen.py` 在 `MEMX_WS_ORCH=1`（默认）时使用编排器：
+1. 权重托管进 MemX 张量（BF16，分块转换）。
+2. Compress epoch，等待后台压缩。
+3. Infer epoch，设定 hot budget。
+4. 每个 matmul / layer：推进热窗、prefetch 下一块 / 下一算子、在热路径外 retire 上一块。
+5. 结束 infer；Final epoch + purge / seal，压终端 RSS。
 
-1. 把权重托管进 MemX 张量（BF16 路径，分块 half 转换）。
-2. 进入 compress epoch；等待后台压缩。
-3. 进入 infer epoch 并设置 hot budget。
-4. 每个 matmul / layer：
-   - pin 或 advance 热窗口
-   - prefetch 下一块 strip / 下一算子
-   - retire 上一块 strip（cold-mark；seal 离开热路径）
-5. 结束 infer epoch。
-6. Final epoch + purge / seal passes，把终端 RSS 压下去。
+密集 strip 尽量批进 `apply_ws`。
 
-Col-strip 与 block/stream WS 在密集意图时尽量批量走 `apply_ws`。
+## 内存下降从何而来
 
-## 为什么同一台机器上 RSS 能差这么大
+同一机器、同一权重：
 
-同样硬件、同样权重，两种驻留模式：
+| 模式 | 驻留内容 | 0.8B 量级 |
+|------|----------|-----------|
+| 朴素托管 | 整包 BF16 权重 | ~1.6–1.8 GB RSS |
+| MemX FullHost 收敛后 | 压缩页 + 小热窗 | final ~110–120 MB |
 
-| 模式 | 内存里住什么 | 0.8B 典型结果 |
-|------|--------------|---------------|
-| 朴素托管 | 整包 BF16 权重常驻 | ~1.6–1.8 GB RSS 量级 |
-| MemX FullHost 压缩后 | 压缩页 + 极小热窗口 | final ~110–120 MB 量级 |
+机制：
 
-机制栈：
+1. 权重页 bitexact 压缩（tensor codec），不是量化。
+2. 匿名压缩池，而不是所有页长期 dirty 驻留。
+3. 仅对当前 matmul strip / layer 流式 HOT。
+4. Prefetch 与 durable hot 分离。
+5. Trail retire 让上一窗口回到压缩态。
+6. Final seal / purge 在推理后把 RSS 压下去。
 
-1. **权重页 bitexact 压缩**（split / tensor codecs），不是量化。
-2. **匿名压缩池**，而不是让所有页一直 dirty 驻留。
-3. **流式 working set**：只有当前 matmul strip / layer 窗口是 HOT。
-4. **Prefetch 与 hot 分离**：未来页可以预热，但不会永久撑大 hot set。
-5. **Trail retire**：上一个窗口回到 cold/compressed，不阻塞计算。
-6. **Final seal / purge**：推理后对 tracked 窗口再压缩，final RSS 塌缩。
-
-Qwen3.5-0.8B 干净 FullHost 参考（bitexact `-24.360558`）：
+干净参考（Qwen3.5-0.8B，bitexact `-24.360558`）：
 
 | 路径 | Infer wall | Infer RSS | Final RSS |
 |------|------------|-----------|-----------|
-| extreme10 历史最佳速度（干净内存） | **0.386s** | **348 MB** | **111 MB** |
-| orchestrator 干净路径（orch4） | 0.450s | 335 MB | 119 MB |
+| extreme10 | **0.386 s** | **348 MB** | **111 MB** |
+| orchestrator 干净路径（orch4） | 0.450 s | 335 MB | 119 MB |
 
-相对 hosted 权重 footprint（~1663 MB）：
+相对 hosted ~1663 MB，final ~111 MB 约 **15×**。压缩与 final seal 充分结算后，FullHost “Saved” 可到约 93%。优先看干净顺序日志；macOS dirty RSS 尖峰（常 1000 MB+）是系统噪声，不当产品指标。
 
-- Final RSS ~111 MB → 最佳约束路径上约 **15×** 进程驻留缩减。
-- FullHost 汇总里的 “Saved” 在压缩与 final seal 充分结算后，可相对模型/托管体积报告约 93%。
+## 相关系统
 
-macOS dirty RSS（经常 1000 MB+）不当真赢；系统内存污染主导方差。优先看 `/tmp/memx_opt/` 下干净顺序 FullHost 日志。
+| 路线 | 例子 | 与 MemX 的差异 |
+|------|------|----------------|
+| 量化 | llama.cpp/GGUF、AWQ、GPTQ、bitsandbytes | 更少比特，精度不同 |
+| mmap 加载 | GGUF / safetensors mmap | 依赖 OS cache；无宿主主导的压缩 WS |
+| Offload | FlexGen、DeepSpeed ZeRO-Inference | 以 CPU/NVMe 搬运为主杠杆 |
+| 系统压缩内存 | macOS memory compression | 系统级，不是 tensor-WS + bitexact 池 API |
 
-## 竞争格局
+MemX 把 bitexact 宿主字节、页压缩匿名内存、Transformer 描述符/codec、以及带池遥测的 epoch/WS 编排合在一起。
 
-类似，但不是同一架构：
-
-| 类别 | 例子 | 优化什么 | 与 MemX 的差距 |
-|------|------|----------|----------------|
-| 量化 | llama.cpp/GGUF、bitsandbytes、AWQ、GPTQ | 每权重比特数 | 改变精度；不是原始张量 bitexact |
-| mmap 加载 | GGUF mmap、safetensors mmap | 加载路径 / OS cache | 仍付 OS 驻留成本；没有进程内压缩 + WS 编排 |
-| Offload 框架 | FlexGen、DeepSpeed ZeRO-Inference | CPU/NVMe 调度 | 偏磁盘/宿主搬运；产品形态不同 |
-| 系统压缩内存 | macOS compressor | 系统级机会式压缩 | 不是宿主主导的 tensor WS + bitexact 池遥测 |
-
-MemX 差异化：
-
-- 原始精度 **bitexact** 宿主视图
-- 显式 API 下的页压缩 **匿名** 驻留
-- Transformer 感知描述符 + tensor codecs
-- epoch + working-set 编排器，用于流式 LLM 窗口
-- pressure / codec / fault 遥测，服务宿主策略
-
-## 仓库结构
-
-```text
-include/memx_runtime.h     公开 C API
-libmemx3.m                 运行时 + 压缩器 + 编排器
-python/memx_runtime.py     ctypes 绑定 + WS helpers
-run_qwen.py                FullHost LLM 驻留 demo
-examples/                  嵌入式宿主示例
-tests/                     Explicit runtime、race、Python bitexact
-benchmarks/                仅 runtime-native 基准
-MemXApp/                   本地 dashboard shell
-ARCHITECTURE_AND_OPTIMIZATION.md
-ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md
-```
-
-本地资产默认忽略：`.local/`、`build/`、`MemXApp.app/`。
-
-## 构建与验证
+## 构建、测试、FullHost
 
 ```bash
 make all
-make examples
 make test-explicit
 make test-compressing-race
 make test-python-bitexact
 ```
-
-嵌入式 demo：
-
-```bash
-make example-embedded
-```
-
-FullHost 0.8B 基线（权重在 `.local/Qwen3.5-0.8B-hf`）：
 
 ```bash
 MEMX_OP_LEVEL_WS=1 MEMX_BLOCK_WS=1 MEMX_STREAM_WS=1 \
@@ -238,58 +163,32 @@ MEMX_ADAPTIVE_CHUNK=1 MEMX_COLD_ASYNC_SEAL=1 MEMX_WS_ORCH=1 \
 DYLD_LIBRARY_PATH=build python3 -u run_qwen.py --model-path .local/Qwen3.5-0.8B-hf
 ```
 
-长等待建议 detached FullHost：
+长任务建议 detached（`Popen(..., start_new_session=True)`）；日志放 `/tmp/memx_opt/`。
 
-```python
-subprocess.Popen(..., start_new_session=True)
-```
+## 优化方向
 
-日志习惯放在 `/tmp/memx_opt/`。
+优先改结构，少堆 env：
 
-## 优化哲学
+- HOT 窗口已覆盖时跳过 syscall。
+- 每个 op/layer 把 matmul 意图批进一次 `apply_ws`。
+- trail seal 离开 infer 热路径。
+- prefetch 与 hot 驻留增长分离。
+- 受 pressure 约束的 prefetch 上限。
+- 在 bitexact 前提下提高真实 weight/KV 压缩率的 codec。
 
-架构优先，旋钮其次。
+目标：干净追平或超过 extreme10（wall ≤ 0.386 s，infer RSS ≤ 350 MB，final ≤ 111 MB，bitexact）；在 macOS 内存污染下稳住 final seal；0.5B/0.8B 多轮均值作回归门禁；让非 demo 宿主更少手写 strip 逻辑。
 
-值得做：
-
-- 已覆盖 HOT 窗口减少 syscall
-- 每个 op/layer 把 matmul 意图批进一次 `apply_ws`
-- trail seal 离开 infer 热路径
-- prefetch 增长与 hot 驻留增长分离
-- pressure-aware prefetch 上限
-- 在 bitexact 前提下提高真实张量压缩率的 codec 选择
-
-避免：
-
-- 把随机 env flag 堆叠当成“架构”
-- 把 dirty 1000 MB+ RSS 当速度胜利
-- final 路径整包 reseal 所有权重
-- 冷却当前 strip 时把整窗重新 pin
-- 在代码里写注释（项目规则：代码不写注释）
-
-## 近期架构目标
-
-1. 干净打赢 extreme10：wall ≤ 0.386s，infer RSS ≤ 350 MB，final ≤ 111 MB，bitexact `-24.360558`。
-2. 窗口已覆盖时，track-local delta-HOT 零 syscall 快路径。
-3. 在 macOS 内存污染条件下稳住 final seal。
-4. 干净机器上保留 0.5B / 0.8B 多轮均值作为回归门禁。
-5. 扩展编排器宿主体验，让非 demo 运行时不必重写 strip 逻辑也能用 epoch/WS。
-
-## 正确性门禁（不可回退）
+## 门禁
 
 - `make test-explicit`
 - `make test-compressing-race`
-- Python bitexact 测试
-- FullHost 0.8B output sum **精确等于** `-24.360558`
-- 优先 clean final RSS，而不是污染系统快照
+- Python bitexact 套件
+- FullHost 0.8B output sum 精确等于 `-24.360558`
+- 优先 clean final RSS，而非污染快照
 
-## 要求与限制
+## 运行要求
 
-- Apple Silicon Mac，macOS 13+，Xcode CLT
-- 压缩路径依赖 Metal
-- 主要面向大块托管分配
-- 不可压数据回退到 raw page 存储
-- 只支持显式宿主接入；不是系统级注入产品
+Apple Silicon，macOS 13+，Xcode CLT。压缩路径依赖 Metal。面向大块托管分配；不可压页存 raw。仅显式宿主接入。
 
 ## 许可证
 
