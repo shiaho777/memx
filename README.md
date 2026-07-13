@@ -131,7 +131,12 @@ This is the direction that scales into real integrations such as KV-cache tiers,
 
 ## Architecture Deep Dive
 
-See [`docs/ARCHITECTURE_AND_OPTIMIZATION.md`](docs/ARCHITECTURE_AND_OPTIMIZATION.md) for:
+Root docs (visible for open-source browsing):
+
+- English: [`ARCHITECTURE_AND_OPTIMIZATION.md`](ARCHITECTURE_AND_OPTIMIZATION.md)
+- 中文: [`ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md`](ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md)
+
+Covers:
 
 - residency orchestrator (epochs + working-set intents)
 - page state machine and bitexact compress guarantees

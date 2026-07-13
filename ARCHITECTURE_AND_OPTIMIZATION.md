@@ -2,6 +2,8 @@
 
 MemX is an embeddable compressed-memory runtime for Apple Silicon. Host applications allocate large buffers into a managed virtual pool; cold pages are compressed, faulted back on demand, and orchestrated as a streaming working set. The design target for LLM hosting is original-precision bitexact residency with process RSS far below raw model size.
 
+Chinese version: [ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md](ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md)
+
 ## Design Thesis
 
 Most LLM memory systems choose one of three axes:
@@ -202,7 +204,8 @@ examples/                  Embedded host example
 tests/                     Explicit runtime, race, Python bitexact
 benchmarks/                Runtime-native benches only
 MemXApp/                   Local dashboard shell
-docs/                      Architecture and optimization notes
+ARCHITECTURE_AND_OPTIMIZATION.md
+ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md
 ```
 
 Ignored local assets: `.local/`, `build/`, `MemXApp.app/`.
