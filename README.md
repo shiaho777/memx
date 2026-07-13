@@ -1,166 +1,219 @@
-# MemX — GPU-Accelerated Transparent Memory Compression for Apple Silicon
+# MemX
 
-> **34.0× effective memory expansion** on a 24GB Mac — run workloads that need 816GB of memory.
+> Embeddable compressed-memory runtime for Apple Silicon apps.
 
-MemX uses the GPU as a memory compression coprocessor. It intercepts your program's memory allocations, compresses idle pages on the GPU, and decompresses them on-demand when accessed — **transparently, with zero code changes**.
+MemX lets a host application overcommit RAM inside its own process by routing managed allocations into a compressed virtual-memory pool. Cold pages are compressed with Metal, faulted back on demand, and tracked with per-context quotas and runtime telemetry.
 
-## How It Works
+This repository is now centered on the explicit runtime API:
 
+- `include/memx_runtime.h`
+- `build/libmemx_runtime.dylib`
+- `examples/embedded_runtime_demo.c`
+
+## What MemX Is For
+
+MemX is useful when your app already owns a large memory tier and needs a better option than dropping straight to SSD swap:
+
+- local AI and LLM runtimes
+- vector databases and search engines
+- in-process caches
+- analytical desktop apps
+- memory-heavy developer tools
+
+The right integration model is: the host opts in, decides which buffers are MemX-managed, sets quotas per workload, and reacts to pressure telemetry.
+
+## What MemX Is Not
+
+- not system-wide macOS memory compression
+- not a code-signing workaround
+- not a finished platform product yet
+
+## Core Runtime Surface
+
+The explicit API already supports:
+
+- runtime init and shutdown
+- managed `malloc` / `calloc` / `realloc`
+- managed `mmap` / `munmap`
+- named runtime contexts
+- per-context quotas
+- Transformer-aware tensor descriptors for weights, KV cache, activations, and hot/no-compress regions
+- ownership-aware accounting
+- pressure and fragmentation telemetry
+- explicit reclaim of stale compressed extents
+
+Minimal integration shape:
+
+```c
+#include "memx_runtime.h"
+
+memx_runtime_context_t *ctx = NULL;
+memx_runtime_context_create("kv-cache", &ctx);
+memx_runtime_context_set_quota(ctx, 512ULL << 20);
+
+void *buf = memx_runtime_context_malloc(ctx, 128ULL << 20);
+
+memx_runtime_pressure_t pressure;
+memx_runtime_get_pressure(&pressure);
+
+memx_runtime_context_free(ctx, buf);
+memx_runtime_context_destroy(ctx);
+memx_runtime_shutdown();
 ```
-Your App → malloc/mmap → MemX intercepts → Compressed GPU pool
-                                        ↓
-                              Page fault → CPU decompress → ~24μs
+
+Transformer-aware allocations let a host runtime expose model semantics without changing tensor contents:
+
+```c
+memx_runtime_tensor_desc_t desc = {
+    .struct_size = sizeof(desc),
+    .role = MEMX_TENSOR_ROLE_KV_CACHE,
+    .dtype = MEMX_TENSOR_DTYPE_FP16,
+    .layout = MEMX_TENSOR_LAYOUT_BLOCKED,
+    .flags = MEMX_TENSOR_FLAG_SEQUENTIAL | MEMX_TENSOR_FLAG_COLD,
+    .rank = 4,
+    .shape = {1, 32, 4096, 128}
+};
+
+void *kv = memx_runtime_context_malloc_tensor(ctx, 512ULL << 20, &desc);
+
+memx_runtime_context_update_tensor_flags(
+    ctx,
+    kv,
+    MEMX_TENSOR_FLAG_COLD | MEMX_TENSOR_FLAG_READ_MOSTLY
+);
+
+memx_runtime_context_update_tensor_flags_range(
+    ctx,
+    kv,
+    old_token_offset,
+    old_token_bytes,
+    MEMX_TENSOR_FLAG_COLD | MEMX_TENSOR_FLAG_READ_MOSTLY
+);
 ```
 
-1. **Allocate**: Large allocations (>64KB) route to MemX's virtual memory pool
-2. **Compress**: Background thread compresses idle pages using Metal GPU shaders
-3. **Decompress**: SIGSEGV handler decompresses on access in ~24μs (4× faster than SSD swap)
-4. **Prefetch**: Sequential access patterns detected → speculatively decompress ahead → 2.5 GB/s
+Those descriptors are bit-exact metadata. They do not quantize or rewrite model data; they give MemX enough context to choose compression, deduplication, hot-path, and prefetch policies per tensor class.
+
+The tensor-specialized codecs are conservative and bit-exact. Warm tensor pages can use a fast FP16/BF16 split codec that separates low and high bytes and run-length encodes the high-byte stream. Cold or read-mostly tensor pages can use a higher-ratio bitplane16 codec. Pages that do not benefit fall back to the default compressor, and decompression restores the original bytes exactly.
 
 ## Quick Start
 
+Build the runtime and the embedded host example:
+
 ```bash
-# Build
-clang -dynamiclib -O2 -framework Metal -framework Foundation -lz \
-  -o libmemx3.dylib libmemx3.m
-
-# Build launcher
-clang -O2 -o memx memx.m -framework Foundation
-
-# Option 1: Run a single program
-./memx ./your_program
-
-# Option 2: Global mode — ALL programs get MemX automatically
-./install.sh
-# (adds DYLD_INSERT_LIBRARIES to your shell profile)
-# Small processes (ls, cat) are NOT affected — lazy init only activates on large allocations
-# Apple-signed binaries are NOT affected — macOS SIP protection
+make explicit-runtime examples
+./build/embedded_runtime_demo
 ```
 
-### How Global Mode Works
+Compare tensor-specific bit-exact codec candidates:
 
-MemX uses **lazy initialization** — the GPU compressor only starts when a program allocates >64KB:
+```bash
+make benchmark-tensor-codecs
+```
 
-| Program | Uses mmap for large allocs? | MemX Activates? | Overhead |
-|---------|------------------------------|-----------------|----------|
-| `ls`, `cat`, `echo` | No | No | ~0μs (just constructor) |
-| `python3 script.py` | Rarely | Only if large mmap | ~0μs if not |
-| C/C++ programs using mmap | Yes | ✅ Yes | ~50ms one-time init |
-| C/C++ programs using malloc (GOT) | Yes* | ✅ Yes | ~50ms one-time init |
-| C/C++ programs using malloc (inlined) | No | No | ~0μs |
+Build your own host process against the explicit runtime:
 
-\* MemX patches GOT entries (`__la_symbol_ptr`) at load time to intercept malloc/free/calloc/realloc. This works for programs compiled with `-fno-builtin-malloc` or that have GOT entries for malloc. Programs where clang inlines malloc calls (`-O2` without `-fno-builtin-malloc`) cannot be intercepted — but most large-memory programs use `mmap` for bulk allocations, which is always intercepted.
+```bash
+clang -O2 -Iinclude your_host.c -Lbuild -Wl,-rpath,@executable_path -lmemx_runtime -o your_host
+```
 
-This means MemX works for virtually all memory-intensive programs — databases, ML frameworks, LLM engines, and servers — since they use `mmap` for large allocations.
+## Embedded Host Example
 
-## Benchmarks (Apple M4 Pro, 24GB)
+`examples/embedded_runtime_demo.c` models the intended product shape:
 
-### Memory Savings
+- create a dedicated managed context
+- set a 192 MB quota
+- allocate cache segments explicitly through MemX
+- tag cache segments as tensor-shaped KV-cache data
+- handle quota pressure by evicting host-owned objects
+- inspect pressure, reclaim stats, and context accounting
 
-| Workload | Size | Savings |
-|----------|------|---------|
-| LLM Weights | 1.5 GB | **56%** |
-| Database KV Store | 512 MB | **67%** |
-| Compiler Objects | 512 MB | **75%** |
-| All Zeros | 1 GB | **84%** |
-| Mixed Real Workloads | 2.3 GB | **53%** |
+This is the direction that scales into real integrations such as KV-cache tiers, tensor arenas, and compressed object stores.
 
-### Performance
+## Architecture Deep Dive
 
-| Metric | Value |
-|--------|-------|
-| P50 fault latency | ~24 μs |
-| P99 fault latency | ~80 μs |
-| Sequential throughput | 2.5 GB/s |
-| Effective memory expansion | **18.8×** |
-| CPU overhead | **<5%** |
-| Thread safety | 1–8 threads ✅ |
-| Data integrity | **PERFECT** (all workloads) |
+See [`docs/ARCHITECTURE_AND_OPTIMIZATION.md`](docs/ARCHITECTURE_AND_OPTIMIZATION.md) for:
 
-### What Does 18.8× Mean?
-
-On a 24GB Mac, MemX can serve **36 GB of logical allocations using only 1.9 GB of physical RAM**. Combined with deduplication (up to 99.9% pool savings), this means:
-
-- A 24GB Mac Mini can run workloads that would otherwise need **450 GB of RAM**
-- No SSD swap, no disk I/O — pure in-memory compression
-
-## Features
-
-- **Adaptive GPU Compressor**: Delta + RLE + LZ77 with zero-density classification (skips LZ77 for sparse pages)
-- **Content-Aware Deduplication**: Identical compressed pages share a single pool entry (FNV-1a + open-addressing, O(1) decref)
-- **Predictive Prefetch**: Detects sequential access patterns, speculatively decompresses ahead (k=2 lookahead)
-- **Cooldown Mechanism**: Prevents recompression of recently accessed pages (5-scan for prefetched, 2-scan for fault-decompressed)
-- **Thread Safety**: CAS atomic state transitions, mutex-protected allocation, memory barriers
-- **Signal-Safe CPU Decompressor**: Stack-efficient, no heap allocation, runs in SIGSEGV handler on sigaltstack
+- residency orchestrator (epochs + working-set intents)
+- page state machine and bitexact compress guarantees
+- why process RSS can drop by ~15× on the same machine without quantization
+- FullHost 0.8B reference numbers and correctness gates
+- competitive landscape vs quant / mmap / offload systems
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────┐
-│                  Your App                    │
-├─────────────────────────────────────────────┤
-│  malloc/mmap interposition (__interpose)     │
-├─────────────────────────────────────────────┤
-│              MemX Runtime                    │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐ │
-│  │ Virtual   │  │ Compress │  │  Dedup    │ │
-│  │ Memory    │  │ Pool     │  │  Table    │ │
-│  │ Pool      │  │          │  │  (FNV-1a) │ │
-│  └──────────┘  └──────────┘  └───────────┘ │
-│  ┌──────────┐  ┌──────────┐                │
-│  │ SIGSEGV  │  │ Background│                │
-│  │ Handler  │  │ Compressor│                │
-│  │ (decomp) │  │ (GPU)     │                │
-│  └──────────┘  └──────────┘                │
-└─────────────────────────────────────────────┘
+```text
+Host app
+  -> explicit MemX-managed allocations
+  -> tensor role, dtype, layout, and hot/cold policy hints
+  -> context quota and ownership tracking
+  -> compressed virtual page pool
+  -> Metal-assisted background compression
+  -> signal-driven fault/decompress path
+  -> pressure telemetry and reclaim
 ```
 
-## Page Lifecycle
+Page lifecycle:
 
+```text
+PAGE_NONE -> PAGE_RESIDENT -> PAGE_COMPRESSED -> PAGE_HOT -> PAGE_RESIDENT
 ```
-PAGE_NONE → PAGE_RESIDENT → PAGE_COMPRESSED → PAGE_HOT → PAGE_RESIDENT
-  (alloc)    (in-memory)    (GPU compress)   (accessed)  (cooldown expiry)
-```
+
+## Current Validation
+
+- `make test-explicit`: explicit runtime smoke test with quota, telemetry, reclaim, and integrity checks
+- `make benchmark-runtime`: runtime-native benchmark suite for sparse, deduplicated, and mixed managed buffers
+- `make benchmark-stress`: multi-threaded context stress benchmark
+- `make benchmark-tensor-codecs`: offline FP16/BF16/KV codec comparison with bit-exact roundtrip checks
+- `make test`: runtime smoke and embedded host example coverage
+
+## Feature Highlights
+
+- adaptive page compression with zero-heavy fast paths
+- content-aware deduplication for identical compressed pages
+- tensor-aware allocation metadata for Transformer weights, KV cache, activations, and embeddings
+- bit-exact FP16/BF16 split and bitplane16 tensor page codecs with default-codec fallback
+- codec and tensor-role telemetry for split, bitplane, weight, and KV-cache savings
+- dynamic tensor flags and range-level demotion so host runtimes can keep new KV hot and later demote old token ranges
+- predictive prefetch on sequential fault patterns
+- per-context quotas and allocation-failure accounting
+- pool pressure, fragmentation, and reclaim telemetry
+- ownership tracking for explicit managed allocations
+
+## Repository Layout
+
+- `libmemx3.m`: core runtime implementation
+- `include/memx_runtime.h`: public explicit runtime API
+- `examples/`: embeddable host examples
+- `tests/`: smoke and integrity tests
+- `benchmarks/`: runtime-native benchmark sources only
+- `MemXApp/`: local runtime dashboard work
+
+`build/` and `.local/` are intentionally ignored so local experiments do not pollute the repo.
 
 ## Requirements
 
-- Apple Silicon Mac (M1/M2/M3/M4)
-- macOS 13+ (Ventura or later)
+- Apple Silicon Mac
+- macOS 13+
 - Xcode Command Line Tools
 
 ## Limitations
 
-- **Apple Silicon only**: Uses Metal compute shaders. Vulkan/CUDA port would enable NVIDIA/AMD GPUs.
-- **Userspace only**: Cannot intercept kernel-allocated memory. Kernel integration would enable system-wide compression.
-- **Incompressible data**: Random/encrypted/already-compressed data is stored raw with zero overhead.
-- **Large allocations only**: Allocations <64KB go through normal malloc (not worth compressing).
-- **Inlined malloc calls**: When clang compiles with `-O2` without `-fno-builtin-malloc`, it may inline malloc calls, bypassing GOT entries. MemX patches GOT entries at load time as a fallback, but inlined calls cannot be intercepted. Most large-memory programs use `mmap` for bulk allocations, which is always intercepted.
+- Apple Silicon only; the compressor depends on Metal
+- large managed allocations are the primary target
+- incompressible data falls back to raw page storage
+- the current runtime is still prototype-quality and needs more host-facing ergonomics
+- only explicit host integration is supported; MemX is not a generic drop-in for arbitrary processes
 
-## Project Structure
+## Local Model Demo
 
-```
-libmemx3.m          # Core library (~720 lines)
-memx.m              # Launcher (sets DYLD_INSERT_LIBRARIES)
-bench_all.m         # Mixed workload benchmark
-bench_real_apps.m   # Real application simulation
-bench_latency.m     # Fault latency measurement
-bench_dedup.m       # Deduplication effectiveness
-bench_mt_expansion.m # Multi-thread + memory expansion
-bench_comparison.m  # GPU vs CPU compression comparison
-```
+`run_qwen.py` resolves the model from:
+
+1. `--model-path`
+2. `MEMX_MODEL_PATH`
+3. `.local/Qwen3.5-0.8B-hf`
+
+That keeps large checkpoints out of the repo root while preserving local experiments.
 
 ## License
 
 MIT
-
-## Citation
-
-If you use MemX in your research:
-
-```bibtex
-@article{memx2026,
-  title={MemX: GPU-Accelerated Transparent Memory Compression with Content-Aware Deduplication on Unified Memory Architectures},
-  author={...},
-  year={2026}
-}
-```

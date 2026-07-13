@@ -1,53 +1,100 @@
 CC = clang
 CFLAGS = -O2
+CPPFLAGS = -Iinclude
 FRAMEWORKS = -framework Metal -framework Foundation
 LIBS = -lz
+BUILD_DIR = build
+RUNTIME_DYLIB = $(BUILD_DIR)/libmemx_runtime.dylib
+BENCHMARK_DIR = benchmarks
+EXAMPLE_DIR = examples
+RUNTIME_BENCHES = benchmark_runtime_suite bench_context_stress bench_tensor_codecs bench_effective_capacity bench_hot_path_latency
+RUNTIME_BENCH_BINS = $(addprefix $(BUILD_DIR)/,$(RUNTIME_BENCHES))
+EXPLICIT_TEST = $(BUILD_DIR)/test_explicit_runtime
+COMPRESSING_RACE_TEST = $(BUILD_DIR)/test_compressing_race
+EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 
-.PHONY: all clean install uninstall test
+.PHONY: all benchmarks examples clean test explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
 
-all: libmemx3.dylib memx
+all: $(RUNTIME_DYLIB)
 
-libmemx3.dylib: libmemx3.m
-	$(CC) -dynamiclib $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $<
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-memx: memx.m
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(RUNTIME_DYLIB): libmemx3.m include/memx_runtime.h | $(BUILD_DIR)
+	$(CC) -dynamiclib $(CPPFLAGS) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $<
 
-# Benchmarks
-bench_all: bench_all.m libmemx3.dylib memx
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(EXPLICIT_TEST): tests/test_explicit_runtime.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-bench_real_apps: bench_real_apps.m libmemx3.dylib memx
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(COMPRESSING_RACE_TEST): tests/test_compressing_race.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c11 -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-bench_latency: bench_latency.m libmemx3.dylib memx
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(EMBEDDED_EXAMPLE): $(EXAMPLE_DIR)/embedded_runtime_demo.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-bench_dedup: bench_dedup.m libmemx3.dylib memx
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(BUILD_DIR)/benchmark_runtime_suite: $(BENCHMARK_DIR)/benchmark_runtime_suite.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-bench_mt_expansion: bench_mt_expansion.m libmemx3.dylib memx
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ $<
+$(BUILD_DIR)/bench_context_stress: $(BENCHMARK_DIR)/bench_context_stress.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-benchmarks: bench_all bench_real_apps bench_latency bench_dedup bench_mt_expansion
+$(BUILD_DIR)/bench_tensor_codecs: $(BENCHMARK_DIR)/bench_tensor_codecs.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
 
-# Run all benchmarks
-test: benchmarks
-	@echo "═══ Running all benchmarks ═══"
-	@./memx ./bench_all 2>&1 | grep -E "saved:|Integrity"
-	@./memx ./bench_latency 2>&1 | grep -E "P50|P99|Throughput|Integrity"
-	@./memx ./bench_dedup 2>&1 | grep -E "Integrity"
-	@./memx ./bench_mt_expansion 2>&1 | grep -E "Integrity|expansion"
+$(BUILD_DIR)/bench_effective_capacity: $(BENCHMARK_DIR)/bench_effective_capacity.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-# Install/uninstall global mode
-install: libmemx3.dylib memx
-	@./install.sh
+$(BUILD_DIR)/bench_hot_path_latency: $(BENCHMARK_DIR)/bench_hot_path_latency.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-uninstall:
-	@./uninstall.sh
+benchmarks: $(RUNTIME_BENCH_BINS)
+
+explicit-runtime: $(RUNTIME_DYLIB)
+
+test-explicit: $(EXPLICIT_TEST)
+	@$(EXPLICIT_TEST)
+
+test-compressing-race: $(COMPRESSING_RACE_TEST)
+	@$(COMPRESSING_RACE_TEST)
+
+test-python-runtime: $(RUNTIME_DYLIB)
+	@python3 tests/test_python_runtime.py
+
+test-python-bitexact: $(RUNTIME_DYLIB)
+	@python3 tests/test_python_bitexact_compute.py
+
+test-python-transformer: $(RUNTIME_DYLIB)
+	@python3 tests/test_python_transformer_lifecycle.py
+
+test-python-torch-transformer: $(RUNTIME_DYLIB)
+	@python3 tests/test_python_torch_transformer.py
+
+test-python-torch-pressure: $(RUNTIME_DYLIB)
+	@python3 tests/test_python_torch_pressure.py
+
+test-python: test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure
+
+examples: $(EMBEDDED_EXAMPLE)
+
+example-embedded: $(EMBEDDED_EXAMPLE)
+	@$(EMBEDDED_EXAMPLE)
+
+benchmark-runtime: $(BUILD_DIR)/benchmark_runtime_suite
+	@$(BUILD_DIR)/benchmark_runtime_suite
+
+benchmark-stress: $(BUILD_DIR)/bench_context_stress
+	@$(BUILD_DIR)/bench_context_stress
+
+benchmark-tensor-codecs: $(BUILD_DIR)/bench_tensor_codecs
+	@$(BUILD_DIR)/bench_tensor_codecs
+
+benchmark-effective-capacity: $(BUILD_DIR)/bench_effective_capacity
+	@$(BUILD_DIR)/bench_effective_capacity
+
+benchmark-hot-path-latency: $(BUILD_DIR)/bench_hot_path_latency
+	@$(BUILD_DIR)/bench_hot_path_latency
+
+test: test-explicit test-compressing-race example-embedded
 
 clean:
-	rm -f libmemx3.dylib memx bench_all bench_real_apps bench_latency \
-	      bench_dedup bench_mt_expansion bench_comparison bench_cpu_overhead \
-	      bench_latency_breakdown bench_gpu_throughput bench_ablation \
-	      bench_prefetch bench_evaluation
+	rm -rf $(BUILD_DIR)

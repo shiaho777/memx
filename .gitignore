@@ -1,62 +1,14 @@
-# Compiled binaries (no extension on macOS)
-/bench_ablation
-/bench_all
-/bench_comparison
-/bench_cpu_overhead
-/bench_dedup
-/bench_evaluation
-/bench_gpu_throughput
-/bench_latency
-/bench_latency_breakdown
-/bench_mt_expansion
-/bench_prefetch
-/bench_real_apps
-/benchmark_suite
-/memx
-/memx_bench
-/memx_daemon
-/memx_debug
-/memx_inject
-/memx_swap
-/memx_v1
-/memx_v3
-/memx_v4
-/memx_vm
-/probe1_cache
-/probe1b
-/probe2
-/probe3
-/probe4
-/probe4b
-/probe4c
-/probe4d
-/probe4e
-/probe4f
-/test_1gb
-/test_dylib
-/test_mem_bandwidth
-/test_mmap
-/test_mprotect
-/test_phys
-/test_phys2
-/test_phys3
-/test_phys4
-/test_real
-/test_realworkload
-/theory_model
+# Local heavyweight assets
+/.local/
 
-# Dylibs
-libmemx.dylib
-libmemx2.dylib
-libmemx3.dylib
-
-# App bundle
-MemXApp.app/
+# Build outputs
+/build/
+/MemXApp.app/
 
 # macOS
 .DS_Store
 *.dSYM
 
-# Build artifacts
+# Generic build artifacts
 *.o
 *.out
