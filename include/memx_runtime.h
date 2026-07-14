@@ -246,7 +246,13 @@ enum {
     MEMX_WS_FLAG_RETIRE = 1u << 2,
     MEMX_WS_FLAG_RETIRE_SYNC = 1u << 3,
     MEMX_WS_FLAG_MARK_ACCESS = 1u << 4,
-    MEMX_WS_FLAG_NO_ASYNC = 1u << 5
+    MEMX_WS_FLAG_NO_ASYNC = 1u << 5,
+    MEMX_WS_FLAG_EPHEMERAL = 1u << 6
+};
+
+enum {
+    MEMX_MATERIALIZE_KEEP_COMPRESSED = 1u << 0,
+    MEMX_MATERIALIZE_ALLOW_RESIDENT = 1u << 1
 };
 
 typedef struct memx_runtime_ws_intent {
@@ -287,6 +293,8 @@ typedef struct memx_runtime_ws_tile {
 int memx_runtime_context_export_archive(memx_runtime_context_t *ctx, void *ptr, const char *path, uint64_t *out_bytes);
 int memx_runtime_context_import_archive(memx_runtime_context_t *ctx, const char *path, const memx_runtime_tensor_desc_t *desc_override, void **out_ptr, size_t *out_size);
 int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile);
+int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, void *dst, size_t dst_cap, uint32_t flags);
+int memx_runtime_context_materialize_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile, void *dst, size_t dst_cap, size_t dst_row_stride, uint32_t flags);
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);
 void *memx_runtime_context_aligned_alloc(memx_runtime_context_t *ctx, size_t alignment, size_t size);

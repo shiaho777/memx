@@ -5450,6 +5450,165 @@ int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime
     return 0;
 }
 
+static int materialize_page_bytes(MemXZone3 *s, size_t pidx, uint8_t *out_page, uint32_t flags) {
+    if (!s || !out_page || pidx >= s->npages) return -1;
+    PageMeta *m = &s->meta[pidx];
+    int keep = (flags & MEMX_MATERIALIZE_KEEP_COMPRESSED) != 0;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        uint8_t st = m->state;
+        if (st == PAGE_HOT && m->comp_size != 0) {
+            wait_decompress_complete(m);
+            continue;
+        }
+        if (st == PAGE_COMPRESSING) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+            continue;
+        }
+        if (st == PAGE_RESIDENT || (st == PAGE_HOT && m->comp_size == 0)) {
+            uint8_t *pa = (uint8_t *)s->vmem + pidx * PAGE_SZ;
+            if (mprotect(pa, PAGE_SZ, PROT_READ) != 0) {
+                if ((flags & MEMX_MATERIALIZE_ALLOW_RESIDENT) == 0) return -1;
+            }
+            memcpy(out_page, pa, PAGE_SZ);
+            return 0;
+        }
+        if (st == PAGE_COMPRESSED) {
+            if (!keep) {
+                if (decompress_compressed_page(s, pidx, 0, 2)) {
+                    uint8_t *pa = (uint8_t *)s->vmem + pidx * PAGE_SZ;
+                    if (mprotect(pa, PAGE_SZ, PROT_READ) != 0) return -1;
+                    memcpy(out_page, pa, PAGE_SZ);
+                    return 0;
+                }
+                continue;
+            }
+            uint32_t d_sz = 0;
+            uint64_t d_off = 0;
+            uint8_t payload[PAGE_SZ];
+            pthread_mutex_lock(&s->alloc_mutex);
+            if (m->state != PAGE_COMPRESSED) {
+                pthread_mutex_unlock(&s->alloc_mutex);
+                continue;
+            }
+            d_sz = m->comp_size;
+            d_off = m->pool_offset;
+            if (d_sz == 0 || d_sz > PAGE_SZ || d_off + (uint64_t)d_sz > s->pool_size) {
+                pthread_mutex_unlock(&s->alloc_mutex);
+                return -1;
+            }
+            memcpy(payload, s->pool + d_off, d_sz);
+            pthread_mutex_unlock(&s->alloc_mutex);
+            cpu_decompress(payload, d_sz, out_page);
+            __sync_fetch_and_add(&s->prefetch_hits, 1);
+            return 0;
+        }
+        if (st == PAGE_NONE) {
+            memset(out_page, 0, PAGE_SZ);
+            return 0;
+        }
+#if defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#endif
+    }
+    return -1;
+}
+
+int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, void *dst, size_t dst_cap, uint32_t flags) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr || !dst) return EINVAL;
+    if (length == 0) return 0;
+    if (dst_cap < length) return EMSGSIZE;
+    if (!g_z || !g_z->running || !is_ours((void *)ptr)) return EINVAL;
+    size_t sp = 0, nbytes = 0;
+    if (ws_resolve_alloc(ctx, (void *)ptr, &sp, &nbytes) != 0) return EINVAL;
+    if (offset > nbytes) return EINVAL;
+    if (offset + length > nbytes) length = nbytes - offset;
+    if (length == 0) return 0;
+    if (flags == 0) flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT;
+
+    uint8_t *out = (uint8_t *)dst;
+    size_t end = offset + length;
+    size_t cur = offset;
+    uint8_t pagebuf[PAGE_SZ];
+    while (cur < end) {
+        size_t page_off = cur / PAGE_SZ;
+        size_t pidx = sp + page_off;
+        if (pidx >= g_z->npages) return EFAULT;
+        size_t inside = cur - page_off * PAGE_SZ;
+        size_t take = PAGE_SZ - inside;
+        if (take > end - cur) take = end - cur;
+        if (materialize_page_bytes(g_z, pidx, pagebuf, flags) != 0) return EIO;
+        memcpy(out + (cur - offset), pagebuf + inside, take);
+        cur += take;
+    }
+    return 0;
+}
+
+int memx_runtime_context_materialize_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile, void *dst, size_t dst_cap, size_t dst_row_stride, uint32_t flags) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !tile || !tile->ptr || !dst) return EINVAL;
+    if (tile->struct_size != 0 && tile->struct_size < sizeof(*tile)) return EINVAL;
+    if (tile->rows == 0 || tile->col_count == 0 || tile->elem_size == 0 || tile->cols == 0) return 0;
+    size_t sp = 0, nbytes = 0;
+    if (ws_resolve_alloc(ctx, tile->ptr, &sp, &nbytes) != 0) return EINVAL;
+    if (tile->col_start >= tile->cols) return EINVAL;
+    size_t col_count = tile->col_count;
+    if (tile->col_start + col_count > tile->cols) col_count = tile->cols - tile->col_start;
+    size_t dense_row = col_count * tile->elem_size;
+    if (dst_row_stride == 0) dst_row_stride = dense_row;
+    if (dst_row_stride < dense_row) return EINVAL;
+    size_t need = (tile->rows - 1) * dst_row_stride + dense_row;
+    if (dst_cap < need) return EMSGSIZE;
+    if (flags == 0) flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT;
+
+    size_t row_bytes = tile->cols * tile->elem_size;
+    size_t col_off = tile->col_start * tile->elem_size;
+    size_t strip = dense_row;
+    uint8_t *out = (uint8_t *)dst;
+
+    enum { CACHE_N = 48 };
+    size_t cache_pidx[CACHE_N];
+    uint8_t cache_page[CACHE_N][PAGE_SZ];
+    uint8_t cache_valid[CACHE_N];
+    memset(cache_valid, 0, sizeof(cache_valid));
+    for (int i = 0; i < CACHE_N; i++) cache_pidx[i] = (size_t)-1;
+    int cache_clock = 0;
+
+    for (size_t r = 0; r < tile->rows; r++) {
+        size_t b = r * row_bytes + col_off;
+        size_t e = b + strip;
+        if (b >= nbytes) break;
+        if (e > nbytes) e = nbytes;
+        size_t cur = b;
+        size_t dst_base = r * dst_row_stride;
+        while (cur < e) {
+            size_t page_off = cur / PAGE_SZ;
+            size_t pidx = sp + page_off;
+            if (pidx >= g_z->npages) return EFAULT;
+            int slot = -1;
+            for (int i = 0; i < CACHE_N; i++) {
+                if (cache_valid[i] && cache_pidx[i] == pidx) { slot = i; break; }
+            }
+            if (slot < 0) {
+                slot = cache_clock;
+                cache_clock = (cache_clock + 1) % CACHE_N;
+                if (materialize_page_bytes(g_z, pidx, cache_page[slot], flags) != 0) return EIO;
+                cache_pidx[slot] = pidx;
+                cache_valid[slot] = 1;
+            }
+            size_t inside = cur - page_off * PAGE_SZ;
+            size_t take = PAGE_SZ - inside;
+            if (take > e - cur) take = e - cur;
+            memcpy(out + dst_base + (cur - b), cache_page[slot] + inside, take);
+            cur += take;
+        }
+    }
+    return 0;
+}
+
+
+
+
 
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr) {
     if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr) return EINVAL;

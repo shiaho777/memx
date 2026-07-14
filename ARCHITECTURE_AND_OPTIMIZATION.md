@@ -130,6 +130,7 @@ Clean reference (Qwen3.5-0.8B, bitexact `-24.360558`):
 |------|------------|-----------|-----------|
 | extreme10 | **0.386 s** | **348 MB** | **111 MB** |
 | orchestrator clean (orch4) | 0.450 s | 335 MB | 119 MB |
+| materialize strip (`MEMX_MATERIALIZE=1`) | 0.434 s | **251 MB** | 116 MB |
 
 Relative to ~1663 MB hosted weights, final ~111 MB is on the order of **15×**. FullHost “Saved” telemetry can report ~93% once compression and final seal settle. Prefer clean sequential logs; macOS dirty RSS spikes (often 1000 MB+) are system noise, not product wins.
 
@@ -181,6 +182,19 @@ Bitexact page blobs for a managed tensor:
 4. Torch views still point at the managed pointer; first touch faults/decompresses as usual.
 
 FullHost hooks: `MEMX_ARCHIVE_DIR`, `MEMX_ARCHIVE_SAVE`, `MEMX_ARCHIVE_LOAD`.
+
+
+
+### Non-destructive materialize (compute fusion step)
+
+Fault/decompress historically **consumes** compressed pool data and leaves pages HOT/resident. For read-mostly weights that is the wrong default during strip matmul.
+
+New APIs:
+
+- `memx_runtime_context_materialize_range` — copy a byte range into a caller buffer
+- `memx_runtime_context_materialize_tile` — gather a column strip into a dense tile buffer (page cache, no large span malloc)
+
+With `MEMX_MATERIALIZE_KEEP_COMPRESSED`, compressed pages are peeked (pool payload → TLS decompress → `dst`) and **remain `PAGE_COMPRESSED`**. FullHost row/col matmul uses this path and can skip pin growth (`MEMX_MATERIALIZE_SKIP_PIN`).
 
 ### Tile working-set API
 

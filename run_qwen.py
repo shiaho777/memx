@@ -1128,6 +1128,54 @@ class MemXHost:
             except Exception:
                 pass
 
+
+    def materialize_enabled(self):
+        return (
+            os.environ.get("MEMX_MATERIALIZE", "1") != "0"
+            and hasattr(self.ctx, "materialize_range")
+            and hasattr(self.ctx, "materialize_tile")
+        )
+
+    def materialize_weight_range(self, name, offset, length, tensor):
+        alloc = self.weight_map.get(name)
+        if alloc is None or tensor is None:
+            return False
+        if not self.materialize_enabled():
+            return False
+        try:
+            if not tensor.is_contiguous():
+                return False
+            nbytes = int(tensor.numel()) * int(tensor.element_size())
+            if nbytes < int(length):
+                return False
+            if int(tensor.element_size()) <= 0:
+                return False
+            self.ctx.materialize_range(alloc, int(offset), int(length), int(tensor.data_ptr()), nbytes)
+            return True
+        except Exception:
+            return False
+
+    def materialize_weight_col_tile(self, name, rows, cols, col_start, col_n, elem, tensor):
+        alloc = self.weight_map.get(name)
+        if alloc is None or tensor is None:
+            return False
+        if not self.materialize_enabled():
+            return False
+        try:
+            if not tensor.is_contiguous():
+                return False
+            need = int(rows) * int(col_n) * int(elem)
+            nbytes = int(tensor.numel()) * int(tensor.element_size())
+            if nbytes < need or int(elem) != int(tensor.element_size()):
+                return False
+            self.ctx.materialize_tile(
+                alloc, int(rows), int(cols), int(elem), int(col_start), int(col_n),
+                int(tensor.data_ptr()), nbytes, int(col_n) * int(elem),
+            )
+            return True
+        except Exception:
+            return False
+
     def pin_weight_col_block(self, name, rows, cols, col_start, col_n, elem, prefetch=True):
         alloc = self.weight_map.get(name)
         if alloc is None or rows <= 0 or cols <= 0 or col_n <= 0 or elem <= 0:
@@ -1574,7 +1622,7 @@ def matmul_weight(x, w, host=None, name=None):
             elif rows <= 1024 and chunk > 256:
                 chunk = 256
         outs = []
-        key = "row"
+        key = ("row", str(w.dtype))
         buf = _matmul_row_buf.get(key)
         if host is not None and name is not None and block and stream:
             host.stream_begin(name)
@@ -1583,26 +1631,34 @@ def matmul_weight(x, w, host=None, name=None):
             off = i * row_bytes
             ln = n * row_bytes
             if host is not None and name is not None and block:
-                if stream:
+                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
+                if stream and not use_mat:
                     pref = 0
                     if look > 0 and i + chunk < rows:
                         pref = min(chunk * max(look, 2), rows - (i + chunk)) * row_bytes
                     host.stream_advance(name, off, ln, prefetch_next=pref)
-                else:
+                elif not use_mat:
                     host.pin_weight_range(name, off, ln, prefetch=True)
-            if buf is None or buf.shape[0] < n or buf.shape[1] != w.shape[1]:
-                buf = torch.empty((chunk, w.shape[1]), dtype=torch.float16)
+            if buf is None or buf.shape[0] < n or buf.shape[1] != w.shape[1] or buf.dtype != w.dtype:
+                buf = torch.empty((chunk, w.shape[1]), dtype=w.dtype)
                 _matmul_row_buf[key] = buf
-            dst = buf[:n]
-            dst.copy_(w[i:i + n])
+            raw = buf[:n]
+            filled = False
+            if host is not None and name is not None and block:
+                filled = host.materialize_weight_range(name, off, ln, raw)
+            if not filled:
+                raw.copy_(w[i:i + n])
+            dst = raw.half() if raw.dtype == torch.bfloat16 else raw
             if host is not None and name is not None and block and stream and look > 0:
-                ni = i + chunk
-                if ni < rows:
-                    nn = min(chunk, rows - ni)
-                    try:
-                        host.prefetch_weight_range(name, ni * row_bytes, nn * row_bytes)
-                    except Exception:
-                        pass
+                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
+                if not use_mat:
+                    ni = i + chunk
+                    if ni < rows:
+                        nn = min(chunk, rows - ni)
+                        try:
+                            host.prefetch_weight_range(name, ni * row_bytes, nn * row_bytes)
+                        except Exception:
+                            pass
             outs.append(torch.nn.functional.linear(x_in, dst))
             if host is not None and name is not None and block and not stream:
                 host.release_weight_range(name, off, ln, force=False)
@@ -1633,14 +1689,16 @@ def matmul_weight(x, w, host=None, name=None):
         n = min(chunk, cols - i)
         if host is not None and name is not None and block:
             if strip:
-                host.pin_weight_col_block(name, rows, cols, i, n, elem, prefetch=True)
-                ni = i + chunk
-                if look > 0 and ni < cols:
-                    nn = min(chunk, cols - ni)
-                    try:
-                        host.prefetch_weight_col_block(name, rows, cols, ni, nn, elem)
-                    except Exception:
-                        pass
+                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
+                if not use_mat:
+                    host.pin_weight_col_block(name, rows, cols, i, n, elem, prefetch=True)
+                    ni = i + chunk
+                    if look > 0 and ni < cols:
+                        nn = min(chunk, cols - ni)
+                        try:
+                            host.prefetch_weight_col_block(name, rows, cols, ni, nn, elem)
+                        except Exception:
+                            pass
             elif stream:
                 if i == 0:
                     hf = min(0.08, max(0.02, float(n) / max(cols, 1)))
@@ -1654,14 +1712,26 @@ def matmul_weight(x, w, host=None, name=None):
                     host.warm_weight(name, hot_frac=hf, full=False)
                 except Exception:
                     pass
-        if buf is None or buf.shape[1] < n or buf.shape[0] != rows:
-            buf = torch.empty((rows, chunk), dtype=torch.float16)
-            _matmul_col_buf[key] = buf
-        dst = buf[:, :n]
-        dst.copy_(w[:, i:i + n])
-        outs.append(torch.nn.functional.linear(x_in, dst.t()))
+        ckey = ("col", str(w.dtype))
+        buf = _matmul_col_buf.get(ckey)
+        if buf is None or buf.shape[1] < n or buf.shape[0] != rows or buf.dtype != w.dtype:
+            buf = torch.empty((rows, chunk), dtype=w.dtype)
+            _matmul_col_buf[ckey] = buf
+        raw = buf[:, :n]
+        filled = False
         if host is not None and name is not None and block and strip:
-            host.release_weight_col_block(name, force=False)
+            filled = host.materialize_weight_col_tile(name, rows, cols, i, n, elem, raw)
+            if filled:
+                try:
+                    host.release_weight_col_block(name, force=False)
+                except Exception:
+                    pass
+        if not filled:
+            raw.copy_(w[:, i:i + n])
+            if host is not None and name is not None and block and strip:
+                host.release_weight_col_block(name, force=False)
+        tile = raw.half() if raw.dtype == torch.bfloat16 else raw
+        outs.append(torch.nn.functional.linear(x_in, tile.t()))
     out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
     if host is not None and name is not None:
         try:

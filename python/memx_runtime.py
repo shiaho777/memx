@@ -218,6 +218,10 @@ MEMX_WS_FLAG_RETIRE = 1 << 2
 MEMX_WS_FLAG_RETIRE_SYNC = 1 << 3
 MEMX_WS_FLAG_MARK_ACCESS = 1 << 4
 MEMX_WS_FLAG_NO_ASYNC = 1 << 5
+MEMX_WS_FLAG_EPHEMERAL = 1 << 6
+
+MEMX_MATERIALIZE_KEEP_COMPRESSED = 1 << 0
+MEMX_MATERIALIZE_ALLOW_RESIDENT = 1 << 1
 
 class WSIntent(ctypes.Structure):
     _fields_ = [
@@ -514,6 +518,16 @@ class Runtime:
             lib.memx_runtime_context_import_archive.restype = ctypes.c_int
             lib.memx_runtime_context_ws_tile.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             lib.memx_runtime_context_ws_tile.restype = ctypes.c_int
+            if hasattr(lib, "memx_runtime_context_materialize_range"):
+                lib.memx_runtime_context_materialize_range.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                ]
+                lib.memx_runtime_context_materialize_range.restype = ctypes.c_int
+                lib.memx_runtime_context_materialize_tile.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32,
+                ]
+                lib.memx_runtime_context_materialize_tile.restype = ctypes.c_int
         lib.memx_runtime_context_ws_close.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
         lib.memx_runtime_context_ws_close.restype = ctypes.c_int
         lib.memx_runtime_context_end_epoch.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -739,6 +753,42 @@ class Context:
         if rc != 0:
             raise OSError(rc, "memx_runtime_context_mark_access_range failed")
 
+
+
+    def materialize_range(self, allocation, offset, length, dst_ptr, dst_cap, flags=None):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_materialize_range"):
+            raise OSError("materialize_range unavailable")
+        if flags is None:
+            flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT
+        rc = self.runtime.lib.memx_runtime_context_materialize_range(
+            self.handle, allocation.ptr, int(offset), int(length),
+            ctypes.c_void_p(int(dst_ptr)), int(dst_cap), int(flags),
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_materialize_range failed")
+
+    def materialize_tile(self, allocation, rows, cols, elem_size, col_start, col_count, dst_ptr, dst_cap, dst_row_stride=0, flags=None):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_materialize_tile"):
+            raise OSError("materialize_tile unavailable")
+        if flags is None:
+            flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT
+        tile = WSTile()
+        tile.struct_size = ctypes.sizeof(WSTile)
+        tile.flags = 0
+        tile.ptr = allocation.ptr
+        tile.rows = int(rows)
+        tile.cols = int(cols)
+        tile.elem_size = int(elem_size)
+        tile.col_start = int(col_start)
+        tile.col_count = int(col_count)
+        tile.prefetch_cols = 0
+        tile.retire_col_start = 0
+        tile.retire_col_count = 0
+        rc = self.runtime.lib.memx_runtime_context_materialize_tile(
+            self.handle, ctypes.byref(tile), ctypes.c_void_p(int(dst_ptr)), int(dst_cap), int(dst_row_stride), int(flags),
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_materialize_tile failed")
 
     def export_archive(self, allocation, path):
         if not hasattr(self.runtime.lib, "memx_runtime_context_export_archive"):

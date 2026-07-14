@@ -20,7 +20,7 @@ Architecture: [`ARCHITECTURE_AND_OPTIMIZATION.md`](ARCHITECTURE_AND_OPTIMIZATION
 
 Large local models and in-process caches often need more virtual capacity than physical RAM allows, while still wanting original-precision compute. Quantization reduces bits; mmap defers to the OS page cache; offload frameworks move tensors to disk or another device. MemX keeps original BF16/FP16/FP32 bytes in process-owned anonymous memory, compresses idle pages, and streams a small hot working set during inference.
 
-On Qwen3.5-0.8B FullHost (bitexact output sum `-24.360558`), a clean constrained path has held about **348 MB** RSS during infer and **111 MB** final after recompress, against ~1.6 GB hosted weights (~**15×** resident reduction on that path).
+On Qwen3.5-0.8B FullHost (bitexact output sum `-24.360558`), a clean constrained path has held about **348 MB** RSS during infer and **111 MB** final after recompress; with non-destructive materialize strips, infer RSS has been measured near **251 MB** (final ~116 MB) at similar bitexact output, against ~1.6 GB hosted weights (~**15×** resident reduction on that path).
 
 ## Integration model
 
@@ -71,6 +71,7 @@ Weight archives and tile residency (architecture path):
 
 - `memx_runtime_context_export_archive` / `import_archive` — offline bitexact page blobs (`.mxwa`); load installs compressed pages without inflating full BF16 first
 - `memx_runtime_context_ws_tile` — matmul column-strip geometry → HOT/PREFETCH/RETIRE without host-side page coalescing
+- `materialize_range` / `materialize_tile` — non-destructive bitexact read into a host buffer while pages stay `PAGE_COMPRESSED` (matmul strip path; `MEMX_MATERIALIZE=1`, `MEMX_MATERIALIZE_SKIP_PIN=1`)
 - FullHost: set `MEMX_ARCHIVE_DIR=/path` to save/load per-tensor archives (`MEMX_ARCHIVE_SAVE=1`, `MEMX_ARCHIVE_LOAD=1`)
 
 
