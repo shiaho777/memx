@@ -14,10 +14,7 @@ Primary surface:
 | Embed example | [`examples/embedded_runtime_demo.c`](examples/embedded_runtime_demo.c) |
 | FullHost LLM demo | [`run_qwen.py`](run_qwen.py) |
 
-Architecture notes (root, for open-source readers):
-
-- English — [`ARCHITECTURE_AND_OPTIMIZATION.md`](ARCHITECTURE_AND_OPTIMIZATION.md)
-- 中文 — [`ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md`](ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md)
+Architecture: [`ARCHITECTURE_AND_OPTIMIZATION.md`](ARCHITECTURE_AND_OPTIMIZATION.md)
 
 ## Why this exists
 
@@ -127,7 +124,6 @@ tests/
 benchmarks/
 MemXApp/
 ARCHITECTURE_AND_OPTIMIZATION.md
-ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md
 ```
 
 `build/` and `.local/` are ignored.

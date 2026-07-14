@@ -1,6 +1,6 @@
 # MemX Architecture and Optimization
 
-English overview of how MemX is structured, how LLM residency is orchestrated, and how we evaluate memory and speed. Chinese edition: [ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md](ARCHITECTURE_AND_OPTIMIZATION.zh-CN.md).
+How MemX is structured, how LLM residency is orchestrated, and how we evaluate memory and speed.
 
 ## Problem
 
