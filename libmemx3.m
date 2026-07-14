@@ -4987,6 +4987,470 @@ int memx_runtime_context_end_epoch(memx_runtime_context_t *ctx, int seal_tracked
     return 0;
 }
 
+
+#define MEMX_ARCHIVE_MAGIC 0x4157584Du
+
+typedef struct memx_archive_file_hdr {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t page_size;
+    uint32_t flags;
+    uint64_t nbytes;
+    uint64_t page_count;
+    uint32_t role;
+    uint32_t dtype;
+    uint32_t layout;
+    uint32_t reserved0;
+    uint64_t shape[4];
+    uint64_t stride[4];
+} memx_archive_file_hdr_t;
+
+typedef struct memx_archive_page_ent {
+    uint32_t comp_size;
+    uint8_t codec;
+    uint8_t kind;
+    uint8_t reserved[2];
+} memx_archive_page_ent_t;
+
+static int archive_write_all(FILE *fp, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        size_t w = fwrite(p + off, 1, n - off, fp);
+        if (w == 0) return -1;
+        off += w;
+    }
+    return 0;
+}
+
+static int archive_read_all(FILE *fp, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        size_t r = fread(p + off, 1, n - off, fp);
+        if (r == 0) return -1;
+        off += r;
+    }
+    return 0;
+}
+
+static int install_precompressed_page(MemXZone3 *s, size_t pidx, const uint8_t *blob, uint32_t csz, uint8_t codec) {
+    if (!s || !blob || csz == 0 || csz > PAGE_SZ || pidx >= s->npages) return -1;
+    PageMeta *m = &s->meta[pidx];
+    uint8_t *pa = (uint8_t *)s->vmem + pidx * PAGE_SZ;
+    pthread_mutex_lock(&s->alloc_mutex);
+    if (s->dedup_pending_free_count > 0) memx_runtime_reclaim_locked(s);
+    if (m->comp_size != 0 && (m->state == PAGE_COMPRESSED || m->state == PAGE_HOT)) {
+        dedup_decref(s, m->pool_offset, m->comp_size);
+        m->pool_offset = 0;
+        m->comp_size = 0;
+        m->codec = 0;
+        if (s->live_compressed_pages) __sync_fetch_and_sub(&s->live_compressed_pages, 1);
+    }
+    uint64_t off = 0;
+    if (pool_alloc_extent_locked(s, csz, &off) != 0) {
+        pthread_mutex_unlock(&s->alloc_mutex);
+        return -1;
+    }
+    pool_prepare_write_range(s, off, csz);
+    memcpy(s->pool + off, blob, csz);
+    {
+        uint64_t start = off & ~((uint64_t)PAGE_SZ - 1);
+        uint64_t end = (off + csz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
+        if (end > s->pool_size) end = s->pool_size;
+        if (end > start) mprotect(s->pool + start, (size_t)(end - start), PROT_READ);
+    }
+    uint64_t h = fnv1a_word(blob, csz);
+    uint32_t slot = (uint32_t)(h & DEDUP_HT_MASK);
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t s2 = (slot + probe) & DEDUP_HT_MASK;
+        if (s->dedup_hash[s2] == 0 || s->dedup_ref[s2] == 0) {
+            s->dedup_hash[s2] = h;
+            s->dedup_off[s2] = off;
+            s->dedup_sz[s2] = csz;
+            s->dedup_ref[s2] = 1;
+            if (s->dedup_rev && s->dedup_rev_size) s->dedup_rev[(uint32_t)(off / PAGE_SZ) & s->dedup_rev_mask] = s2;
+            break;
+        }
+        if (s->dedup_hash[s2] == h && s->dedup_sz[s2] == csz && s->dedup_ref[s2] > 0 &&
+            s->dedup_off[s2] < s->pool_size && memcmp(s->pool + s->dedup_off[s2], blob, csz) == 0) {
+            pool_free_insert_locked(s, off, csz);
+            off = s->dedup_off[s2];
+            __sync_fetch_and_add(&s->dedup_ref[s2], 1);
+            break;
+        }
+    }
+    uint8_t st = m->state;
+    mprotect(pa, PAGE_SZ, PROT_NONE);
+    m->pool_offset = off;
+    m->comp_size = csz;
+    m->codec = codec;
+    m->preferred_codec = codec ? codec : m->preferred_codec;
+    m->dirty = 0;
+    m->codec_fail_streak = 0;
+    __sync_synchronize();
+    m->state = PAGE_COMPRESSED;
+    if (st == PAGE_RESIDENT || st == PAGE_HOT || st == PAGE_COMPRESSING) {
+        if (s->live_resident_pages) __sync_fetch_and_sub(&s->live_resident_pages, 1);
+    }
+    __sync_fetch_and_add(&s->live_compressed_pages, 1);
+    __sync_fetch_and_add(&s->pool_used, csz);
+    note_page_compressed(s, pidx, codec, csz);
+    page_release_physical(s, pidx);
+    pthread_mutex_unlock(&s->alloc_mutex);
+    return 0;
+}
+
+static int install_raw_page(MemXZone3 *s, size_t pidx, const uint8_t *raw) {
+    if (!s || !raw || pidx >= s->npages) return -1;
+    PageMeta *m = &s->meta[pidx];
+    uint8_t *pa = (uint8_t *)s->vmem + pidx * PAGE_SZ;
+    if (m->state == PAGE_COMPRESSED || (m->state == PAGE_HOT && m->comp_size != 0)) {
+        pthread_mutex_lock(&s->alloc_mutex);
+        if (m->comp_size) {
+            dedup_decref(s, m->pool_offset, m->comp_size);
+            m->pool_offset = 0;
+            m->comp_size = 0;
+            m->codec = 0;
+            if (s->live_compressed_pages) __sync_fetch_and_sub(&s->live_compressed_pages, 1);
+        }
+        pthread_mutex_unlock(&s->alloc_mutex);
+    }
+    mprotect(pa, PAGE_SZ, PROT_READ | PROT_WRITE);
+#if defined(MADV_FREE_REUSE)
+    madvise(pa, PAGE_SZ, MADV_FREE_REUSE);
+#endif
+    memcpy(pa, raw, PAGE_SZ);
+    m->dirty = 0;
+    m->state = PAGE_RESIDENT;
+    m->codec = 0;
+    m->comp_size = 0;
+    m->pool_offset = 0;
+    int prot = page_wants_write_protect(m) ? PROT_READ : (PROT_READ | PROT_WRITE);
+    mprotect(pa, PAGE_SZ, prot);
+    res_list_add(s, (uint32_t)pidx);
+    return 0;
+}
+
+int memx_runtime_context_export_archive(memx_runtime_context_t *ctx, void *ptr, const char *path, uint64_t *out_bytes) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr || !path || !path[0]) return EINVAL;
+    if (!g_z || !g_z->running || !is_ours(ptr)) return EINVAL;
+    size_t sp = ((uintptr_t)ptr - (uintptr_t)g_z->vmem) / PAGE_SZ;
+    if (sp >= g_z->npages || g_z->meta[sp].owner_tag != (uintptr_t)ctx || g_z->meta[sp].alloc_size == 0)
+        return EINVAL;
+    size_t nbytes = g_z->meta[sp].alloc_size;
+    size_t npages = (nbytes + PAGE_SZ - 1) / PAGE_SZ;
+    uint64_t dummy = 0;
+    memx_runtime_context_force_compress_range(ctx, ptr, 0, nbytes, &dummy);
+
+    memx_archive_page_ent_t *ents = (memx_archive_page_ent_t *)calloc(npages, sizeof(*ents));
+    if (!ents) return ENOMEM;
+    uint8_t **blobs = (uint8_t **)calloc(npages, sizeof(uint8_t *));
+    if (!blobs) { free(ents); return ENOMEM; }
+
+    int rc = 0;
+    uint64_t payload = 0;
+    for (size_t i = 0; i < npages; i++) {
+        size_t pidx = sp + i;
+        PageMeta *m = &g_z->meta[pidx];
+        uint8_t st = m->state;
+        if ((st == PAGE_COMPRESSED || st == PAGE_HOT) && m->comp_size > 0 && m->comp_size <= PAGE_SZ) {
+            uint32_t csz = m->comp_size;
+            uint64_t off = m->pool_offset;
+            uint8_t *buf = (uint8_t *)malloc(csz);
+            if (!buf) { rc = ENOMEM; break; }
+            pthread_mutex_lock(&g_z->alloc_mutex);
+            if (off + csz <= g_z->pool_size) {
+                pool_prepare_write_range(g_z, off, csz);
+                memcpy(buf, g_z->pool + off, csz);
+                {
+                    uint64_t start = off & ~((uint64_t)PAGE_SZ - 1);
+                    uint64_t end = (off + csz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
+                    if (end > g_z->pool_size) end = g_z->pool_size;
+                    if (end > start) mprotect(g_z->pool + start, (size_t)(end - start), PROT_READ);
+                }
+            } else {
+                free(buf);
+                buf = NULL;
+            }
+            pthread_mutex_unlock(&g_z->alloc_mutex);
+            if (!buf) {
+                force_compress_page_now(g_z, pidx);
+                m = &g_z->meta[pidx];
+                if ((m->state == PAGE_COMPRESSED || m->state == PAGE_HOT) && m->comp_size > 0) {
+                    csz = m->comp_size;
+                    off = m->pool_offset;
+                    buf = (uint8_t *)malloc(csz);
+                    if (!buf) { rc = ENOMEM; break; }
+                    pthread_mutex_lock(&g_z->alloc_mutex);
+                    pool_prepare_write_range(g_z, off, csz);
+                    memcpy(buf, g_z->pool + off, csz);
+                    {
+                        uint64_t start = off & ~((uint64_t)PAGE_SZ - 1);
+                        uint64_t end = (off + csz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
+                        if (end > g_z->pool_size) end = g_z->pool_size;
+                        if (end > start) mprotect(g_z->pool + start, (size_t)(end - start), PROT_READ);
+                    }
+                    pthread_mutex_unlock(&g_z->alloc_mutex);
+                }
+            }
+            if (buf) {
+                ents[i].comp_size = csz;
+                ents[i].codec = m->codec;
+                ents[i].kind = 0;
+                blobs[i] = buf;
+                payload += csz;
+                continue;
+            }
+        }
+        uint8_t *raw = (uint8_t *)malloc(PAGE_SZ);
+        if (!raw) { rc = ENOMEM; break; }
+        if (m->state == PAGE_COMPRESSED || (m->state == PAGE_HOT && m->comp_size != 0)) {
+            if (decompress_compressed_page(g_z, pidx, 0, 0) != 0) {
+                free(raw);
+                rc = EIO;
+                break;
+            }
+        }
+        uint8_t *pa = (uint8_t *)g_z->vmem + pidx * PAGE_SZ;
+        mprotect(pa, PAGE_SZ, PROT_READ);
+        memcpy(raw, pa, PAGE_SZ);
+        ents[i].comp_size = PAGE_SZ;
+        ents[i].codec = 0;
+        ents[i].kind = 1;
+        blobs[i] = raw;
+        payload += PAGE_SZ;
+    }
+
+    if (rc == 0) {
+        memx_archive_file_hdr_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic = MEMX_ARCHIVE_MAGIC;
+        hdr.version = MEMX_ARCHIVE_VERSION;
+        hdr.page_size = (uint32_t)PAGE_SZ;
+        hdr.flags = 0;
+        hdr.nbytes = (uint64_t)nbytes;
+        hdr.page_count = (uint64_t)npages;
+        hdr.role = g_z->meta[sp].tensor_role;
+        hdr.dtype = g_z->meta[sp].tensor_dtype;
+        hdr.layout = g_z->meta[sp].tensor_layout;
+        FILE *fp = fopen(path, "wb");
+        if (!fp) rc = errno ? errno : EIO;
+        else {
+            if (archive_write_all(fp, &hdr, sizeof(hdr)) != 0) rc = EIO;
+            if (rc == 0 && archive_write_all(fp, ents, npages * sizeof(*ents)) != 0) rc = EIO;
+            for (size_t i = 0; rc == 0 && i < npages; i++) {
+                if (archive_write_all(fp, blobs[i], ents[i].comp_size) != 0) rc = EIO;
+            }
+            if (fclose(fp) != 0 && rc == 0) rc = EIO;
+            if (rc != 0) unlink(path);
+        }
+        if (rc == 0 && out_bytes) *out_bytes = (uint64_t)sizeof(hdr) + (uint64_t)npages * sizeof(*ents) + payload;
+    }
+
+    for (size_t i = 0; i < npages; i++) free(blobs[i]);
+    free(blobs);
+    free(ents);
+    return rc;
+}
+
+int memx_runtime_context_import_archive(memx_runtime_context_t *ctx, const char *path, const memx_runtime_tensor_desc_t *desc_override, void **out_ptr, size_t *out_size) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !path || !path[0] || !out_ptr) return EINVAL;
+    if (memx_runtime_init() != 0) return ENOMEM;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return errno ? errno : EIO;
+    memx_archive_file_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    int rc = 0;
+    if (archive_read_all(fp, &hdr, sizeof(hdr)) != 0) rc = EIO;
+    if (rc == 0 && (hdr.magic != MEMX_ARCHIVE_MAGIC || hdr.version != MEMX_ARCHIVE_VERSION || hdr.page_size != PAGE_SZ))
+        rc = EINVAL;
+    if (rc == 0 && (hdr.nbytes == 0 || hdr.page_count == 0)) rc = EINVAL;
+    size_t expect_pages = 0;
+    if (rc == 0) {
+        expect_pages = (size_t)((hdr.nbytes + PAGE_SZ - 1) / PAGE_SZ);
+        if (hdr.page_count != (uint64_t)expect_pages) rc = EINVAL;
+    }
+    memx_archive_page_ent_t *ents = NULL;
+    if (rc == 0) {
+        ents = (memx_archive_page_ent_t *)calloc(expect_pages, sizeof(*ents));
+        if (!ents) rc = ENOMEM;
+        else if (archive_read_all(fp, ents, expect_pages * sizeof(*ents)) != 0) rc = EIO;
+    }
+    memx_runtime_tensor_desc_t desc;
+    memset(&desc, 0, sizeof(desc));
+    if (desc_override && desc_override->struct_size >= sizeof(desc)) {
+        desc = *desc_override;
+        desc.struct_size = (uint32_t)sizeof(desc);
+    } else {
+        desc.struct_size = (uint32_t)sizeof(desc);
+        desc.role = hdr.role ? hdr.role : MEMX_TENSOR_ROLE_WEIGHT;
+        desc.dtype = hdr.dtype;
+        desc.layout = hdr.layout ? hdr.layout : MEMX_TENSOR_LAYOUT_ROW_MAJOR;
+        desc.flags = MEMX_TENSOR_FLAG_READ_MOSTLY | MEMX_TENSOR_FLAG_COLD;
+        for (int i = 0; i < 4; i++) {
+            desc.shape[i] = hdr.shape[i];
+            desc.stride[i] = hdr.stride[i];
+        }
+    }
+    void *ptr = NULL;
+    if (rc == 0) {
+        ptr = memx_runtime_context_malloc_tensor(ctx, (size_t)hdr.nbytes, &desc);
+        if (!ptr) rc = ENOMEM;
+    }
+    if (rc == 0) {
+        size_t sp = ((uintptr_t)ptr - (uintptr_t)g_z->vmem) / PAGE_SZ;
+        for (size_t i = 0; i < expect_pages; i++) {
+            uint32_t csz = ents[i].comp_size;
+            if (csz == 0 || csz > PAGE_SZ) { rc = EINVAL; break; }
+            uint8_t *buf = (uint8_t *)malloc(csz);
+            if (!buf) { rc = ENOMEM; break; }
+            if (archive_read_all(fp, buf, csz) != 0) { free(buf); rc = EIO; break; }
+            if (ents[i].kind == 1) {
+                if (csz != PAGE_SZ) { free(buf); rc = EINVAL; break; }
+                if (install_raw_page(g_z, sp + i, buf) != 0) { free(buf); rc = EIO; break; }
+            } else {
+                if (install_precompressed_page(g_z, sp + i, buf, csz, ents[i].codec) != 0) {
+                    free(buf);
+                    rc = EIO;
+                    break;
+                }
+            }
+            free(buf);
+        }
+        if (rc == 0) {
+            memx_runtime_context_update_tensor_flags_range(
+                ctx, ptr, 0, (size_t)hdr.nbytes,
+                MEMX_TENSOR_FLAG_READ_MOSTLY | MEMX_TENSOR_FLAG_COLD);
+        } else {
+            memx_runtime_context_free(ctx, ptr);
+            ptr = NULL;
+        }
+    }
+    fclose(fp);
+    free(ents);
+    if (rc != 0) return rc;
+    *out_ptr = ptr;
+    if (out_size) *out_size = (size_t)hdr.nbytes;
+    return 0;
+}
+
+static int ws_tile_collect_ranges(size_t rows, size_t cols, size_t elem, size_t col0, size_t coln, size_t nbytes,
+                                  size_t *out_off, size_t *out_ln, int max_ranges, int *out_n) {
+    if (!out_off || !out_ln || !out_n || max_ranges <= 0) return EINVAL;
+    *out_n = 0;
+    if (rows == 0 || cols == 0 || elem == 0 || coln == 0) return 0;
+    if (col0 >= cols) return 0;
+    if (col0 + coln > cols) coln = cols - col0;
+    size_t row_bytes = cols * elem;
+    size_t strip = coln * elem;
+    size_t col_off = col0 * elem;
+    size_t cur0 = (size_t)-1, cur1 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        size_t b = r * row_bytes + col_off;
+        size_t e = b + strip;
+        if (b >= nbytes) break;
+        if (e > nbytes) e = nbytes;
+        size_t p0 = (b / PAGE_SZ) * PAGE_SZ;
+        size_t p1 = ((e + PAGE_SZ - 1) / PAGE_SZ) * PAGE_SZ;
+        if (p1 > nbytes) p1 = nbytes;
+        if (p1 <= p0) continue;
+        if (cur0 == (size_t)-1) {
+            cur0 = p0; cur1 = p1;
+        } else if (p0 <= cur1) {
+            if (p1 > cur1) cur1 = p1;
+        } else {
+            if (*out_n >= max_ranges) return ENOMEM;
+            out_off[*out_n] = cur0;
+            out_ln[*out_n] = cur1 - cur0;
+            (*out_n)++;
+            cur0 = p0; cur1 = p1;
+        }
+    }
+    if (cur0 != (size_t)-1) {
+        if (*out_n >= max_ranges) return ENOMEM;
+        out_off[*out_n] = cur0;
+        out_ln[*out_n] = cur1 - cur0;
+        (*out_n)++;
+    }
+    return 0;
+}
+
+int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !tile || !tile->ptr) return EINVAL;
+    if (tile->struct_size != 0 && tile->struct_size < sizeof(*tile)) return EINVAL;
+    size_t sp = 0, nbytes = 0;
+    if (ws_resolve_alloc(ctx, tile->ptr, &sp, &nbytes) != 0) return EINVAL;
+    uint32_t flags = tile->flags ? tile->flags : (MEMX_WS_FLAG_HOT | MEMX_WS_FLAG_PREFETCH | MEMX_WS_FLAG_MARK_ACCESS);
+    if (tile->retire_col_count > 0) {
+        size_t roff[128], rln[128];
+        int rn = 0;
+        int rrc = ws_tile_collect_ranges(tile->rows, tile->cols, tile->elem_size,
+                                         tile->retire_col_start, tile->retire_col_count, nbytes,
+                                         roff, rln, 128, &rn);
+        if (rrc == 0) {
+            int sync = (flags & (MEMX_WS_FLAG_RETIRE_SYNC | MEMX_WS_FLAG_NO_ASYNC)) != 0;
+            for (int i = 0; i < rn; i++) {
+                if (flags & MEMX_WS_FLAG_RETIRE)
+                    ws_retire_range(ctx, tile->ptr, roff[i], rln[i], sync);
+                else
+                    ws_cold_range(ctx, tile->ptr, roff[i], rln[i]);
+            }
+        }
+    }
+    size_t off[192], ln[192];
+    int n = 0;
+    int rc = ws_tile_collect_ranges(tile->rows, tile->cols, tile->elem_size,
+                                    tile->col_start, tile->col_count, nbytes,
+                                    off, ln, 192, &n);
+    if (rc != 0) return rc;
+    if (n == 0) return 0;
+    size_t cover0 = off[0];
+    size_t cover1 = off[n - 1] + ln[n - 1];
+    size_t covered = 0;
+    for (int i = 0; i < n; i++) covered += ln[i];
+    double density = (cover1 > cover0) ? ((double)covered / (double)(cover1 - cover0)) : 1.0;
+    if (density >= 0.55 || n <= 4) {
+        size_t pref = 0;
+        if ((flags & MEMX_WS_FLAG_PREFETCH) && tile->prefetch_cols > 0) {
+            size_t poff[64], pln[64];
+            int pn = 0;
+            size_t pstart = tile->col_start + tile->col_count;
+            if (ws_tile_collect_ranges(tile->rows, tile->cols, tile->elem_size,
+                                       pstart, tile->prefetch_cols, nbytes,
+                                       poff, pln, 64, &pn) == 0 && pn > 0) {
+                pref = (poff[pn - 1] + pln[pn - 1]) > cover1 ? ((poff[pn - 1] + pln[pn - 1]) - cover1) : 0;
+            }
+        }
+        return memx_runtime_context_ws_advance(ctx, tile->ptr, cover0, cover1 - cover0, pref, flags);
+    }
+    memx_runtime_ws_intent_t intents[192];
+    memset(intents, 0, sizeof(intents));
+    for (int i = 0; i < n; i++) {
+        intents[i].struct_size = (uint32_t)sizeof(intents[i]);
+        intents[i].flags = flags & ~MEMX_WS_FLAG_RETIRE & ~MEMX_WS_FLAG_RETIRE_SYNC;
+        intents[i].ptr = tile->ptr;
+        intents[i].offset = off[i];
+        intents[i].length = ln[i];
+        intents[i].prefetch_length = 0;
+    }
+    rc = memx_runtime_context_apply_ws(ctx, intents, (size_t)n);
+    if (rc != 0) return rc;
+    if ((flags & MEMX_WS_FLAG_PREFETCH) && tile->prefetch_cols > 0) {
+        size_t poff[64], pln[64];
+        int pn = 0;
+        size_t pstart = tile->col_start + tile->col_count;
+        if (ws_tile_collect_ranges(tile->rows, tile->cols, tile->elem_size,
+                                   pstart, tile->prefetch_cols, nbytes,
+                                   poff, pln, 64, &pn) == 0) {
+            for (int i = 0; i < pn; i++)
+                memx_runtime_context_prefetch_range(ctx, tile->ptr, poff[i], pln[i]);
+        }
+    }
+    return 0;
+}
+
+
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr) {
     if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr) return EINVAL;
     if (!g_z || !is_ours(ptr)) return EINVAL;

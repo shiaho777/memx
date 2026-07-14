@@ -13,7 +13,7 @@ EXPLICIT_TEST = $(BUILD_DIR)/test_explicit_runtime
 COMPRESSING_RACE_TEST = $(BUILD_DIR)/test_compressing_race
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 
-.PHONY: all benchmarks examples clean test explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
+.PHONY: all benchmarks examples clean test explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-weight-archive test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
 
 all: $(RUNTIME_DYLIB)
 
@@ -62,6 +62,9 @@ test-python-runtime: $(RUNTIME_DYLIB)
 
 test-python-bitexact: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_bitexact_compute.py
+
+test-weight-archive: $(RUNTIME_DYLIB)
+	@python3 tests/test_weight_archive.py
 
 test-python-transformer: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_transformer_lifecycle.py

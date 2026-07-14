@@ -67,6 +67,13 @@ Codecs used for tensor pages (FP16/BF16 split, delta-split, bitplane16, sparse-b
 
 ## Runtime capabilities
 
+Weight archives and tile residency (architecture path):
+
+- `memx_runtime_context_export_archive` / `import_archive` — offline bitexact page blobs (`.mxwa`); load installs compressed pages without inflating full BF16 first
+- `memx_runtime_context_ws_tile` — matmul column-strip geometry → HOT/PREFETCH/RETIRE without host-side page coalescing
+- FullHost: set `MEMX_ARCHIVE_DIR=/path` to save/load per-tensor archives (`MEMX_ARCHIVE_SAVE=1`, `MEMX_ARCHIVE_LOAD=1`)
+
+
 - Init / shutdown, managed `malloc` / `calloc` / `realloc` / aligned alloc / `mmap`
 - Named contexts and per-context quotas
 - Tensor descriptors and range flag updates

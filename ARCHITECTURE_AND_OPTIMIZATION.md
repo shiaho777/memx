@@ -165,6 +165,27 @@ DYLD_LIBRARY_PATH=build python3 -u run_qwen.py --model-path .local/Qwen3.5-0.8B-
 
 Long runs work better detached (`Popen(..., start_new_session=True)`); logs under `/tmp/memx_opt/`.
 
+
+
+## Weight archive and tile residency
+
+First architecture cut beyond pure online compress:
+
+### Offline weight archive (`.mxwa`)
+
+Bitexact page blobs for a managed tensor:
+
+1. Host writes weights once (or reuses an existing managed allocation).
+2. `memx_runtime_context_export_archive` force-compresses, then writes header + per-page codec/blob directory.
+3. Later runs call `memx_runtime_context_import_archive` to allocate the tensor and **install precompressed pool pages** (`PAGE_COMPRESSED`) without a full BF16 inflate-then-compress cycle.
+4. Torch views still point at the managed pointer; first touch faults/decompresses as usual.
+
+FullHost hooks: `MEMX_ARCHIVE_DIR`, `MEMX_ARCHIVE_SAVE`, `MEMX_ARCHIVE_LOAD`.
+
+### Tile working-set API
+
+`memx_runtime_context_ws_tile` takes row/col/elem geometry and maps column strips to page ranges, then applies HOT / PREFETCH / optional RETIRE. This moves strip coalescing from Python host loops into the runtime (step toward decompress–compute fusion).
+
 ## Optimization direction
 
 Prefer structural changes over env-flag stacking:

@@ -231,6 +231,23 @@ class WSIntent(ctypes.Structure):
         ("_reserved0", ctypes.c_uint32),
     ]
 
+class WSTile(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("ptr", ctypes.c_void_p),
+        ("rows", ctypes.c_size_t),
+        ("cols", ctypes.c_size_t),
+        ("elem_size", ctypes.c_size_t),
+        ("col_start", ctypes.c_size_t),
+        ("col_count", ctypes.c_size_t),
+        ("prefetch_cols", ctypes.c_size_t),
+        ("retire_col_start", ctypes.c_size_t),
+        ("retire_col_count", ctypes.c_size_t),
+    ]
+
+
+
 
 
 def _default_library_path():
@@ -490,6 +507,13 @@ class Runtime:
         lib.memx_runtime_context_apply_ws.restype = ctypes.c_int
         lib.memx_runtime_context_ws_advance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32]
         lib.memx_runtime_context_ws_advance.restype = ctypes.c_int
+        if hasattr(lib, "memx_runtime_context_export_archive"):
+            lib.memx_runtime_context_export_archive.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64)]
+            lib.memx_runtime_context_export_archive.restype = ctypes.c_int
+            lib.memx_runtime_context_import_archive.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+            lib.memx_runtime_context_import_archive.restype = ctypes.c_int
+            lib.memx_runtime_context_ws_tile.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.memx_runtime_context_ws_tile.restype = ctypes.c_int
         lib.memx_runtime_context_ws_close.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
         lib.memx_runtime_context_ws_close.restype = ctypes.c_int
         lib.memx_runtime_context_end_epoch.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -714,6 +738,62 @@ class Context:
         rc = self.runtime.lib.memx_runtime_context_mark_access_range(self.handle, allocation.ptr, offset, length)
         if rc != 0:
             raise OSError(rc, "memx_runtime_context_mark_access_range failed")
+
+
+    def export_archive(self, allocation, path):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_export_archive"):
+            raise OSError("export_archive unavailable")
+        out = ctypes.c_uint64(0)
+        rc = self.runtime.lib.memx_runtime_context_export_archive(
+            self.handle, allocation.ptr, path.encode("utf-8"), ctypes.byref(out)
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_export_archive failed")
+        return int(out.value)
+
+    def import_archive(self, path, desc=None, name=""):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_import_archive"):
+            raise OSError("import_archive unavailable")
+        out_ptr = ctypes.c_void_p()
+        out_size = ctypes.c_size_t(0)
+        desc_arg = ctypes.c_void_p()
+        desc_ref = None
+        if desc is not None:
+            if getattr(desc, "struct_size", 0) == 0:
+                desc.struct_size = ctypes.sizeof(desc)
+            desc_ref = desc
+            desc_arg = ctypes.byref(desc)
+        rc = self.runtime.lib.memx_runtime_context_import_archive(
+            self.handle,
+            path.encode("utf-8"),
+            desc_arg if desc is not None else None,
+            ctypes.byref(out_ptr),
+            ctypes.byref(out_size),
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_import_archive failed")
+        return Allocation(self, out_ptr, int(out_size.value), name=name)
+
+    def ws_tile(self, allocation, rows, cols, elem_size, col_start, col_count, prefetch_cols=0, retire_col_start=0, retire_col_count=0, flags=None):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_ws_tile"):
+            raise OSError("ws_tile unavailable")
+        if flags is None:
+            flags = MEMX_WS_FLAG_HOT | MEMX_WS_FLAG_PREFETCH | MEMX_WS_FLAG_MARK_ACCESS
+        tile = WSTile()
+        tile.struct_size = ctypes.sizeof(WSTile)
+        tile.flags = int(flags)
+        tile.ptr = allocation.ptr
+        tile.rows = int(rows)
+        tile.cols = int(cols)
+        tile.elem_size = int(elem_size)
+        tile.col_start = int(col_start)
+        tile.col_count = int(col_count)
+        tile.prefetch_cols = int(prefetch_cols)
+        tile.retire_col_start = int(retire_col_start)
+        tile.retire_col_count = int(retire_col_count)
+        rc = self.runtime.lib.memx_runtime_context_ws_tile(self.handle, ctypes.byref(tile))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_ws_tile failed")
 
     def destroy(self):
         if self.handle:

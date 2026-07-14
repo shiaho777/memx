@@ -197,6 +197,29 @@ class MemXHost:
         ctx.set_quota(quota_mb * memx.MB)
         return cls(runtime, ctx)
 
+
+    def archive_dir(self):
+        d = os.environ.get("MEMX_ARCHIVE_DIR", "").strip()
+        if not d:
+            return None
+        path = Path(d)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+        return path
+
+    def archive_path_for(self, name):
+        root = self.archive_dir()
+        if root is None or not name:
+            return None
+        safe = name.replace(os.sep, "__").replace("/", "__").replace(" ", "_")
+        if len(safe) > 180:
+            import hashlib
+            safe = hashlib.sha1(name.encode("utf-8")).hexdigest() + ".mxwa"
+            return root / safe
+        return root / (safe + ".mxwa")
+
     def alloc_kv(self, tokens=256):
         size = tokens * self.token_bytes
         desc = memx.tensor_desc(
@@ -253,21 +276,61 @@ class MemXHost:
             memx.MEMX_TENSOR_ROLE_WEIGHT,
             dtype_code,
             memx.MEMX_TENSOR_LAYOUT_ROW_MAJOR,
-            0,
+            memx.MEMX_TENSOR_FLAG_READ_MOSTLY | memx.MEMX_TENSOR_FLAG_COLD,
             shape=shape,
             stride=tuple(src_tensor.stride()),
         )
-        try:
-            alloc = self.ctx.malloc_tensor(nbytes, desc, name=name)
-        except MemoryError:
-            return None
-        import ctypes
-        src_u8 = src_tensor.view(torch.uint8).contiguous()
-        buf = alloc.buffer()
-        ctypes.memmove(ctypes.addressof(buf), src_u8.data_ptr(), nbytes)
-        del src_u8
-        del src_tensor
-        self._seal_weight(alloc, nbytes)
+        arch = self.archive_path_for(name)
+        use_arch = (
+            arch is not None
+            and os.environ.get("MEMX_ARCHIVE_LOAD", "1") != "0"
+            and arch.is_file()
+            and hasattr(self.ctx, "import_archive")
+        )
+        alloc = None
+        if use_arch:
+            try:
+                if arch.stat().st_size > 64:
+                    alloc = self.ctx.import_archive(str(arch), desc=desc, name=name)
+                    if alloc is None or alloc.size != nbytes:
+                        if alloc is not None:
+                            try:
+                                alloc.free()
+                            except Exception:
+                                pass
+                        alloc = None
+            except Exception:
+                alloc = None
+        if alloc is None:
+            try:
+                alloc = self.ctx.malloc_tensor(nbytes, desc, name=name)
+            except MemoryError:
+                return None
+            import ctypes
+            src_u8 = src_tensor.view(torch.uint8).contiguous()
+            buf = alloc.buffer()
+            ctypes.memmove(ctypes.addressof(buf), src_u8.data_ptr(), nbytes)
+            del src_u8
+            del src_tensor
+            self._seal_weight(alloc, nbytes)
+            if (
+                arch is not None
+                and os.environ.get("MEMX_ARCHIVE_SAVE", "1") != "0"
+                and hasattr(self.ctx, "export_archive")
+            ):
+                try:
+                    self.ctx.force_compress_range(alloc, 0, nbytes)
+                except Exception:
+                    pass
+                try:
+                    self.ctx.export_archive(alloc, str(arch))
+                except Exception:
+                    pass
+        else:
+            try:
+                self._seal_weight(alloc, nbytes)
+            except Exception:
+                pass
         hosted = None
         if replace:
             try:
@@ -1118,6 +1181,27 @@ class MemXHost:
             self.pin_weight_range(name, cover0, cover1 - cover0, prefetch=prefetch)
             return
         prev = self._pin_state.get(name)
+        if self._ws_orch and hasattr(self.ctx, "ws_tile"):
+            try:
+                retire0 = 0
+                retire_n = 0
+                if prev is not None and (prev[0] != cover0 or prev[1] != cover1):
+                    # best-effort: retire previous cover window via col geometry when possible
+                    pass
+                self.ctx.ws_tile(
+                    alloc,
+                    rows=rows,
+                    cols=cols,
+                    elem_size=elem,
+                    col_start=col_start,
+                    col_count=col_n,
+                    prefetch_cols=0,
+                    flags=memx.MEMX_WS_FLAG_HOT | (memx.MEMX_WS_FLAG_PREFETCH if prefetch else 0) | memx.MEMX_WS_FLAG_MARK_ACCESS,
+                )
+                self._pin_state[name] = (cover0, cover1)
+                return
+            except Exception:
+                pass
         if self._ws_orch and hasattr(self.ctx, 'apply_ws'):
             try:
                 intents = []

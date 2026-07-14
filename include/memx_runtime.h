@@ -265,6 +265,28 @@ int memx_runtime_context_apply_ws(memx_runtime_context_t *ctx, const memx_runtim
 int memx_runtime_context_ws_advance(memx_runtime_context_t *ctx, void *ptr, size_t hot_offset, size_t hot_length, size_t prefetch_length, uint32_t flags);
 int memx_runtime_context_ws_close(memx_runtime_context_t *ctx, void *ptr, uint32_t flags);
 int memx_runtime_context_end_epoch(memx_runtime_context_t *ctx, int seal_tracked);
+
+enum {
+    MEMX_ARCHIVE_VERSION = 1
+};
+
+typedef struct memx_runtime_ws_tile {
+    uint32_t struct_size;
+    uint32_t flags;
+    void *ptr;
+    size_t rows;
+    size_t cols;
+    size_t elem_size;
+    size_t col_start;
+    size_t col_count;
+    size_t prefetch_cols;
+    size_t retire_col_start;
+    size_t retire_col_count;
+} memx_runtime_ws_tile_t;
+
+int memx_runtime_context_export_archive(memx_runtime_context_t *ctx, void *ptr, const char *path, uint64_t *out_bytes);
+int memx_runtime_context_import_archive(memx_runtime_context_t *ctx, const char *path, const memx_runtime_tensor_desc_t *desc_override, void **out_ptr, size_t *out_size);
+int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile);
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);
 void *memx_runtime_context_aligned_alloc(memx_runtime_context_t *ctx, size_t alignment, size_t size);
