@@ -222,6 +222,7 @@ MEMX_WS_FLAG_EPHEMERAL = 1 << 6
 
 MEMX_MATERIALIZE_KEEP_COMPRESSED = 1 << 0
 MEMX_MATERIALIZE_ALLOW_RESIDENT = 1 << 1
+MEMX_MATERIALIZE_BF16_TO_FP16 = 1 << 2
 
 class WSIntent(ctypes.Structure):
     _fields_ = [
@@ -528,6 +529,11 @@ class Runtime:
                     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32,
                 ]
                 lib.memx_runtime_context_materialize_tile.restype = ctypes.c_int
+                if hasattr(lib, "memx_runtime_context_materialize_prefetch_range"):
+                    lib.memx_runtime_context_materialize_prefetch_range.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32,
+                    ]
+                    lib.memx_runtime_context_materialize_prefetch_range.restype = ctypes.c_int
         lib.memx_runtime_context_ws_close.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
         lib.memx_runtime_context_ws_close.restype = ctypes.c_int
         lib.memx_runtime_context_end_epoch.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -754,6 +760,18 @@ class Context:
             raise OSError(rc, "memx_runtime_context_mark_access_range failed")
 
 
+
+
+    def materialize_prefetch_range(self, allocation, offset, length, flags=None):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_materialize_prefetch_range"):
+            return
+        if flags is None:
+            flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT
+        rc = self.runtime.lib.memx_runtime_context_materialize_prefetch_range(
+            self.handle, allocation.ptr, int(offset), int(length), int(flags)
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_materialize_prefetch_range failed")
 
     def materialize_range(self, allocation, offset, length, dst_ptr, dst_cap, flags=None):
         if not hasattr(self.runtime.lib, "memx_runtime_context_materialize_range"):

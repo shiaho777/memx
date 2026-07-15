@@ -131,6 +131,7 @@ Clean reference (Qwen3.5-0.8B, bitexact `-24.360558`):
 | extreme10 | **0.386 s** | **348 MB** | **111 MB** |
 | orchestrator clean (orch4) | 0.450 s | 335 MB | 119 MB |
 | materialize strip (`MEMX_MATERIALIZE=1`) | 0.434 s | **251 MB** | 116 MB |
+| materialize + fused FP16 + ND prefetch | **0.400–0.412 s** | clean-machine ~250 class; dirty runs vary | ~116–232 |
 
 Relative to ~1663 MB hosted weights, final ~111 MB is on the order of **15×**. FullHost “Saved” telemetry can report ~93% once compression and final seal settle. Prefer clean sequential logs; macOS dirty RSS spikes (often 1000 MB+) are system noise, not product wins.
 
@@ -195,6 +196,13 @@ New APIs:
 - `memx_runtime_context_materialize_tile` — gather a column strip into a dense tile buffer (page cache, no large span malloc)
 
 With `MEMX_MATERIALIZE_KEEP_COMPRESSED`, compressed pages are peeked (pool payload → TLS decompress → `dst`) and **remain `PAGE_COMPRESSED`**. FullHost row/col matmul uses this path and can skip pin growth (`MEMX_MATERIALIZE_SKIP_PIN`).
+
+Speed path (fused GEMM feed):
+
+- Zone-level ND page cache (128 pages) avoids re-decompress across strips
+- `MEMX_MATERIALIZE_BF16_TO_FP16` converts into the FP16 matmul buffer in one pass (no extra `tensor.half()` copy)
+- `materialize_prefetch_range` warms the cache for the next strip without HOT residency
+- Observed: wall **0.400–0.412 s** with bitexact `-24.360558` (vs ~0.434 s pre-fusion materialize)
 
 ### Tile working-set API
 

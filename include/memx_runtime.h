@@ -252,7 +252,8 @@ enum {
 
 enum {
     MEMX_MATERIALIZE_KEEP_COMPRESSED = 1u << 0,
-    MEMX_MATERIALIZE_ALLOW_RESIDENT = 1u << 1
+    MEMX_MATERIALIZE_ALLOW_RESIDENT = 1u << 1,
+    MEMX_MATERIALIZE_BF16_TO_FP16 = 1u << 2
 };
 
 typedef struct memx_runtime_ws_intent {
@@ -295,6 +296,7 @@ int memx_runtime_context_import_archive(memx_runtime_context_t *ctx, const char 
 int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile);
 int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, void *dst, size_t dst_cap, uint32_t flags);
 int memx_runtime_context_materialize_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile, void *dst, size_t dst_cap, size_t dst_row_stride, uint32_t flags);
+int memx_runtime_context_materialize_prefetch_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, uint32_t flags);
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);
 void *memx_runtime_context_aligned_alloc(memx_runtime_context_t *ctx, size_t alignment, size_t size);
