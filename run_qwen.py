@@ -1656,7 +1656,12 @@ def matmul_weight(x, w, host=None, name=None):
             except Exception:
                 pass
         return out
-    chunk = int(os.environ.get("MEMX_MATMUL_CHUNK", "384"))
+    chunk = int(os.environ.get("MEMX_MATMUL_CHUNK", "0"))
+    if chunk <= 0:
+        if host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled():
+            chunk = int(os.environ.get("MEMX_MATMUL_CHUNK_MAT", "512"))
+        else:
+            chunk = 384
     if chunk < 32:
         chunk = 32
     elem = w.element_size()
@@ -1698,19 +1703,31 @@ def matmul_weight(x, w, host=None, name=None):
                     dst.copy_(w[i:i + n].half())
                 else:
                     dst.copy_(w[i:i + n])
+            pref_th = None
             if host is not None and name is not None and block and look > 0:
                 use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
                 ni = i + chunk
                 if ni < rows:
                     nn = min(chunk, rows - ni)
                     if use_mat:
-                        host.materialize_prefetch_weight_range(name, ni * row_bytes, nn * row_bytes)
+                        import threading
+                        pref_th = threading.Thread(
+                            target=host.materialize_prefetch_weight_range,
+                            args=(name, ni * row_bytes, nn * row_bytes),
+                            daemon=True,
+                        )
+                        pref_th.start()
                     elif stream:
                         try:
                             host.prefetch_weight_range(name, ni * row_bytes, nn * row_bytes)
                         except Exception:
                             pass
             outs.append(torch.nn.functional.linear(x_in, dst))
+            if pref_th is not None:
+                try:
+                    pref_th.join(timeout=0.05)
+                except Exception:
+                    pass
             if host is not None and name is not None and block and not stream:
                 host.release_weight_range(name, off, ln, force=False)
         out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
@@ -1779,11 +1796,6 @@ def matmul_weight(x, w, host=None, name=None):
                     host.release_weight_col_block(name, force=False)
                 except Exception:
                     pass
-                if look > 0:
-                    ni = i + chunk
-                    if ni < cols:
-                        nn = min(chunk, cols - ni)
-                        host.materialize_prefetch_weight_col(name, rows, cols, ni, nn, elem)
         if not filled:
             if w.dtype == torch.bfloat16:
                 tile.copy_(w[:, i:i + n].half())
@@ -1791,7 +1803,25 @@ def matmul_weight(x, w, host=None, name=None):
                 tile.copy_(w[:, i:i + n])
             if host is not None and name is not None and block and strip:
                 host.release_weight_col_block(name, force=False)
+        # async ND warm next strip while this GEMM runs
+        pref_th = None
+        if host is not None and name is not None and block and strip and look > 0 and host.materialize_enabled():
+            ni = i + chunk
+            if ni < cols:
+                nn = min(chunk, cols - ni)
+                import threading
+                pref_th = threading.Thread(
+                    target=host.materialize_prefetch_weight_col,
+                    args=(name, rows, cols, ni, nn, elem),
+                    daemon=True,
+                )
+                pref_th.start()
         outs.append(torch.nn.functional.linear(x_in, tile.t()))
+        if pref_th is not None:
+            try:
+                pref_th.join(timeout=0.05)
+            except Exception:
+                pass
     out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
     if host is not None and name is not None:
         try:

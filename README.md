@@ -20,7 +20,7 @@ Architecture: [`ARCHITECTURE_AND_OPTIMIZATION.md`](ARCHITECTURE_AND_OPTIMIZATION
 
 Large local models and in-process caches often need more virtual capacity than physical RAM allows, while still wanting original-precision compute. Quantization reduces bits; mmap defers to the OS page cache; offload frameworks move tensors to disk or another device. MemX keeps original BF16/FP16/FP32 bytes in process-owned anonymous memory, compresses idle pages, and streams a small hot working set during inference.
 
-On Qwen3.5-0.8B FullHost (bitexact output sum `-24.360558`), a clean constrained path has held about **348 MB** RSS during infer and **111 MB** final after recompress; with non-destructive materialize strips, infer RSS has been measured near **251 MB** (final ~116 MB); fused BF16→FP16 materialize + ND prefetch brings wall near **0.40 s** while keeping bitexact `-24.360558`, against ~1.6 GB hosted weights (~**15×** resident reduction on that path).
+On Qwen3.5-0.8B FullHost (bitexact output sum `-24.360558`), a clean constrained path has held about **348 MB** RSS during infer and **111 MB** final after recompress; with non-destructive materialize strips, infer RSS has been measured near **251 MB** (final ~116 MB); fused BF16→FP16 materialize + TLS/async ND cache brings wall near **0.397 s** with infer RSS ~**250 MB** / final ~**126 MB**, bitexact `-24.360558`, against ~1.6 GB hosted weights (~**15×** resident reduction on that path).
 
 ## Integration model
 
