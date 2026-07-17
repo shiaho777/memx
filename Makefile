@@ -12,10 +12,11 @@ RUNTIME_BENCH_BINS = $(addprefix $(BUILD_DIR)/,$(RUNTIME_BENCHES))
 EXPLICIT_TEST = $(BUILD_DIR)/test_explicit_runtime
 COMPRESSING_RACE_TEST = $(BUILD_DIR)/test_compressing_race
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
+CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 
-.PHONY: all benchmarks examples clean test explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
+.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
 
-all: $(RUNTIME_DYLIB)
+all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -104,3 +105,8 @@ test: test-explicit test-compressing-race example-embedded
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+$(CAPSULE_VESSEL): tools/memx_capsule_vessel.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+capsule-vessel: $(CAPSULE_VESSEL)

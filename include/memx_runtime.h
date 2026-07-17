@@ -195,6 +195,10 @@ int memx_runtime_get_stats(memx_runtime_stats_t *out_stats);
 int memx_runtime_get_pressure(memx_runtime_pressure_t *out_pressure);
 int memx_runtime_reclaim(uint64_t *out_reclaimed_bytes);
 int memx_runtime_compact(uint64_t *out_reclaimed_bytes);
+int memx_runtime_trim(uint32_t flags, uint64_t *out_reclaimed_bytes);
+int memx_runtime_recompress_begin(uint32_t zlib_level);
+int memx_runtime_recompress_end(uint64_t *out_reclaimed_bytes);
+int memx_runtime_context_recompress_range(memx_runtime_context_t *ctx, void *ptr, size_t offset, size_t length, uint64_t *out_pages);
 int memx_runtime_test_set_pool_cursor(size_t cursor_bytes);
 int memx_runtime_get_allocation_info(const void *ptr, memx_runtime_allocation_info_t *out_info);
 int memx_runtime_get_allocation_info_range(const void *ptr, size_t offset, size_t length, memx_runtime_allocation_info_t *out_info);
@@ -297,6 +301,30 @@ int memx_runtime_context_ws_tile(memx_runtime_context_t *ctx, const memx_runtime
 int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, void *dst, size_t dst_cap, uint32_t flags);
 int memx_runtime_context_materialize_tile(memx_runtime_context_t *ctx, const memx_runtime_ws_tile_t *tile, void *dst, size_t dst_cap, size_t dst_row_stride, uint32_t flags);
 int memx_runtime_context_materialize_prefetch_range(memx_runtime_context_t *ctx, const void *ptr, size_t offset, size_t length, uint32_t flags);
+
+typedef struct memx_runtime_capsule_stats {
+    uint64_t ent_count;
+    uint64_t spill_bytes;
+    uint64_t page_bytes;
+    uint64_t ledger_bytes;
+    uint64_t materialize_pages;
+    uint64_t materialize_bytes;
+    int attached;
+    uint64_t materialize_spans;
+    uint64_t materialize_batch_pages;
+    int dense;
+    int export_clone;
+} memx_runtime_capsule_stats_t;
+
+int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes);
+int memx_runtime_capsule_attach(const char *dirpath);
+int memx_runtime_capsule_detach(void);
+int memx_runtime_capsule_materialize(uint32_t pidx, void *dst, size_t dst_cap);
+int memx_runtime_capsule_materialize_rank(uint64_t rank, void *dst, size_t dst_cap);
+int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *dst, size_t dst_stride);
+int memx_runtime_capsule_pidx_at(uint64_t rank, uint32_t *out_pidx);
+int memx_runtime_capsule_stats(memx_runtime_capsule_stats_t *out_stats);
+
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);
 void *memx_runtime_context_aligned_alloc(memx_runtime_context_t *ctx, size_t alignment, size_t size);

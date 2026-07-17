@@ -550,6 +550,14 @@ class Runtime:
         lib.memx_runtime_reclaim.restype = ctypes.c_int
         lib.memx_runtime_compact.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
         lib.memx_runtime_compact.restype = ctypes.c_int
+        lib.memx_runtime_trim.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+        lib.memx_runtime_trim.restype = ctypes.c_int
+        lib.memx_runtime_recompress_begin.argtypes = [ctypes.c_uint32]
+        lib.memx_runtime_recompress_begin.restype = ctypes.c_int
+        lib.memx_runtime_recompress_end.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+        lib.memx_runtime_recompress_end.restype = ctypes.c_int
+        lib.memx_runtime_context_recompress_range.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64)]
+        lib.memx_runtime_context_recompress_range.restype = ctypes.c_int
         lib.memx_runtime_test_set_pool_cursor.argtypes = [ctypes.c_size_t]
         lib.memx_runtime_test_set_pool_cursor.restype = ctypes.c_int
         lib.memx_runtime_shutdown.argtypes = []
@@ -597,6 +605,25 @@ class Runtime:
             raise OSError(rc, "memx_runtime_compact failed")
         return int(reclaimed.value)
 
+    def trim(self, flags=1):
+        reclaimed = ctypes.c_uint64(0)
+        rc = self.lib.memx_runtime_trim(ctypes.c_uint32(flags), ctypes.byref(reclaimed))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_trim failed")
+        return int(reclaimed.value)
+
+    def recompress_begin(self, zlib_level=6):
+        rc = self.lib.memx_runtime_recompress_begin(ctypes.c_uint32(zlib_level))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_recompress_begin failed")
+
+    def recompress_end(self):
+        out = ctypes.c_uint64(0)
+        rc = self.lib.memx_runtime_recompress_end(ctypes.byref(out))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_recompress_end failed")
+        return int(out.value)
+
     def test_set_pool_cursor(self, cursor_bytes):
         rc = self.lib.memx_runtime_test_set_pool_cursor(cursor_bytes)
         if rc != 0:
@@ -604,6 +631,93 @@ class Runtime:
 
     def shutdown(self):
         self.lib.memx_runtime_shutdown()
+
+    def capsule_export(self, dirpath):
+        out = ctypes.c_uint64(0)
+        rc = self.lib.memx_runtime_capsule_export(ctypes.c_char_p(dirpath.encode() if isinstance(dirpath, str) else dirpath), ctypes.byref(out))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_export failed")
+        return int(out.value)
+
+    def capsule_attach(self, dirpath):
+        rc = self.lib.memx_runtime_capsule_attach(ctypes.c_char_p(dirpath.encode() if isinstance(dirpath, str) else dirpath))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_attach failed")
+
+    def capsule_detach(self):
+        rc = self.lib.memx_runtime_capsule_detach()
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_detach failed")
+
+    def capsule_materialize_rank(self, rank, buf):
+        if not isinstance(buf, (bytearray, memoryview)):
+            raise TypeError("buf must be bytearray/memoryview")
+        try:
+            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        except TypeError:
+            arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+            addr = ctypes.addressof(arr)
+        rc = self.lib.memx_runtime_capsule_materialize_rank(ctypes.c_uint64(int(rank)), ctypes.c_void_p(addr), ctypes.c_size_t(len(buf)))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_materialize_rank failed")
+        return True
+
+    def capsule_materialize(self, pidx, buf):
+        if not isinstance(buf, (bytearray, memoryview)):
+            raise TypeError("buf must be bytearray/memoryview")
+        try:
+            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        except TypeError:
+            arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+            addr = ctypes.addressof(arr)
+        rc = self.lib.memx_runtime_capsule_materialize(ctypes.c_uint32(int(pidx)), ctypes.c_void_p(addr), ctypes.c_size_t(len(buf)))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_materialize failed")
+        return True
+
+    def capsule_pidx_at(self, rank):
+        out = ctypes.c_uint32(0)
+        rc = self.lib.memx_runtime_capsule_pidx_at(ctypes.c_uint64(int(rank)), ctypes.byref(out))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_pidx_at failed")
+        return int(out.value)
+
+    def capsule_materialize_v(self, pidxs, buf, stride=16384):
+        if not isinstance(buf, (bytearray, memoryview)):
+            raise TypeError("buf must be bytearray/memoryview")
+        arr = (ctypes.c_uint32 * len(pidxs))(*[int(x) for x in pidxs])
+        try:
+            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
+        except TypeError:
+            b = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+            addr = ctypes.addressof(b)
+        if not hasattr(self.lib, "memx_runtime_capsule_materialize_v"):
+            raise OSError("memx_runtime_capsule_materialize_v missing")
+        rc = self.lib.memx_runtime_capsule_materialize_v(arr, ctypes.c_uint32(len(pidxs)), ctypes.c_void_p(addr), ctypes.c_size_t(int(stride)))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_materialize_v failed")
+        return True
+
+    def capsule_stats(self):
+        class CapsuleStats(ctypes.Structure):
+            _fields_ = [
+                ("ent_count", ctypes.c_uint64),
+                ("spill_bytes", ctypes.c_uint64),
+                ("page_bytes", ctypes.c_uint64),
+                ("ledger_bytes", ctypes.c_uint64),
+                ("materialize_pages", ctypes.c_uint64),
+                ("materialize_bytes", ctypes.c_uint64),
+                ("attached", ctypes.c_int),
+                ("materialize_spans", ctypes.c_uint64),
+                ("materialize_batch_pages", ctypes.c_uint64),
+                ("dense", ctypes.c_int),
+                ("export_clone", ctypes.c_int),
+            ]
+        out = CapsuleStats()
+        rc = self.lib.memx_runtime_capsule_stats(ctypes.byref(out))
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_stats failed")
+        return out
 
 
 class Context:
@@ -683,6 +797,17 @@ class Context:
         )
         if rc != 0:
             raise OSError(rc, "memx_runtime_context_seal_range failed")
+        return out.value
+
+    def recompress_range(self, allocation, offset=0, length=None):
+        if length is None:
+            length = allocation.size
+        out = ctypes.c_uint64(0)
+        rc = self.runtime.lib.memx_runtime_context_recompress_range(
+            self.handle, allocation.ptr, offset, length, ctypes.byref(out)
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_recompress_range failed")
         return out.value
 
     def seal_range_async(self, allocation, offset=0, length=None):
