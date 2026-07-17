@@ -1,10 +1,12 @@
 # MemX Architecture and Optimization
 
-How MemX is structured, how LLM residency is orchestrated, and how we evaluate memory and speed.
+How MemX is structured, how LLM residency is orchestrated, and how we evaluate memory and speed on Apple Silicon.
+
+**Product framing:** MemX aims for **~100× lower LLM memory** as a stable multi-plane headline (original precision / bitexact), with transparent measured planes on Qwen3.5-0.8B: **~9× phys footprint**, **~100× engine cold**, **~300× vessel capability**. Host `ps` RSS is not the sole scoreboard when external file-cache COW inflates resident samples.
 
 ## Problem
 
-Local LLM hosts and other large in-process caches must retain large tensors while keeping process RSS under control. Changing numerical precision (quantization), relying on OS mmap alone, or scheduling disk/CPU offload are established options. MemX addresses a different cut of the problem: **original-precision tensors in anonymous process memory**, compressed when cold, with an explicit streaming working set during compute.
+Local LLM hosts and other large in-process caches must retain large tensors while keeping process memory under control. Changing numerical precision (quantization), relying on OS mmap alone, or scheduling disk/CPU offload are established options. MemX addresses a different cut of the problem: **original-precision tensors in anonymous process memory**, compressed when cold, with an explicit streaming working set during compute, plus a **Sovereign Capsule Relay** that exports the weight plane as a transferable capability rather than permanent process RSS.
 
 Correctness bar for the FullHost path: decompress always restores the same bytes the host wrote; Qwen3.5-0.8B FullHost is gated on output sum **`-24.360558`**.
 
@@ -105,6 +107,24 @@ Each context tracks a bounded set of windows. Covered ranges with unchanged flag
 5. End infer; final epoch + purge / seal passes for terminal RSS.
 
 Dense strip work batches through `apply_ws` when the host can.
+
+## Sovereign Capsule Relay (SCR)
+
+SCR exports the compressed weight fabric as a capability directory:
+
+- `spill.bin` — compressed pages (APFS clone/hardlink when possible)
+- `ledger.bin` — page catalog
+- `rank.map` — dense O(1) rank records (`csz`, `off`) for lite attach
+
+Attach modes:
+
+- full ledger in memory
+- **lite** attach (ledger on demand)
+- **rank** materialize (`materialize_rank`) for vessel and host bind paths
+
+The ultralite vessel (`tools/memx_capsule_vessel.c`) attaches without Torch and materializes pages into a single-page scratch buffer. That process measures the **capability plane** (~300× class on 0.8B), distinct from engine-cold structure (~100×) and phys footprint (~9×).
+
+Host bind after export keeps a lite capsule attached so the weight capability can survive phoenix seal of the live zone surfaces.
 
 ## Memory reduction mechanism
 
