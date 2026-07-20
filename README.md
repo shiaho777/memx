@@ -182,6 +182,10 @@ MemX is a **bit-exact residency runtime**: compress when cold, stream when hot, 
 
 Apple Silicon, macOS 13+, Xcode CLT. Metal compressor path available (CPU-only vessel paths supported). Explicit host integration only.
 
+## Contributing
+
+Changes use **Issue → PR into `main` → CI (`gate`) → merge**. See [CONTRIBUTING.md](CONTRIBUTING.md). Agents: [AGENTS.md](AGENTS.md) Delivery section. Linked Issues close only on merge via `Fixes #N` / `Closes #N`.
+
 ## License
 
 MIT
