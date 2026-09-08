@@ -207,6 +207,16 @@ Vessel (`tools/memx_capsule_vessel.c`): no Torch, lite attach + single-page scra
 
 Optional host bind (`MEMX_CAPSULE_HOST_BIND`) keeps the capability live so phoenix can tear down zone surfaces without erasing the weight plane. Named spill keep (`MEMX_POOL_SPILL_KEEP`) enables path-based clone; unlinked anonymous spill forces byte copy.
 
+### Generic data (non-tensor)
+
+MemX is not LLM-only. Any large managed allocation can use the compressed residency plane:
+
+- **Descriptor-less `context_malloc`** compresses through the generic path: zero-page fast path (8 bytes/page), Metal byte-delta + RLE/LZ77, and zlib. Synchronous `force_compress_range` / `seal_range` work (zlib is admitted for generic pages); with `MEMX_CPU_ONLY=1` the background compressor falls back to CPU zlib instead of retrying Metal forever.
+- **`MEMX_TENSOR_ROLE_DATA`** declares a generic data segment: zlib-preferred for any dtype, sparse-byte eligible for INT8/UINT8/INT32/FP32, no AI-role heuristics applied.
+- `make test-generic` gates both paths bitexact (fault verify + materialize); `make benchmark-generic` reports ratio/throughput for zeros / text / structured-i32 classes against a plain zlib-1 baseline.
+
+Known limitation: incompressible generic pages (e.g. random bytes) are stored raw and retried by the background compressor each pass — see the res_list churn issue for the tracking of the retry/pollution behavior.
+
 ### Non-destructive materialize and archives
 
 Fault/decompress can **consume** compressed pool data into HOT residency. For read-mostly weight strips that is often wrong.

@@ -3508,7 +3508,8 @@ static int tensor_sparse_byte_eligible(MemXZone3 *s, size_t page_index) {
         role != MEMX_TENSOR_ROLE_KV_CACHE &&
         role != MEMX_TENSOR_ROLE_ACTIVATION &&
         role != MEMX_TENSOR_ROLE_EMBEDDING &&
-        role != MEMX_TENSOR_ROLE_TEMPORARY) return 0;
+        role != MEMX_TENSOR_ROLE_TEMPORARY &&
+        role != MEMX_TENSOR_ROLE_DATA) return 0;
     if (dtype != MEMX_TENSOR_DTYPE_FP16 &&
         dtype != MEMX_TENSOR_DTYPE_BF16 &&
         dtype != MEMX_TENSOR_DTYPE_FP32 &&
@@ -5322,7 +5323,8 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         }
         if (sticky_ran != MEMX_CODEC_ZLIB &&
             (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
-             role == MEMX_TENSOR_ROLE_KV_CACHE)) {
+             role == MEMX_TENSOR_ROLE_KV_CACHE ||
+             role == MEMX_TENSOR_ROLE_DATA || role == MEMX_TENSOR_ROLE_UNKNOWN)) {
             uint32_t zcsz = zlib_page_compress(src, codec_tmp, PAGE_SZ);
             if (zcsz > 0 && (best_csz == 0 || zcsz < best_csz)) {
                 best_csz = zcsz;
@@ -5607,7 +5609,6 @@ static void *bg_compressor(void *arg) {
             }
         }
         s->res_count = new_res;
-        
         if(nc==0){
             // Fallback: if res_list is empty but there may be untracked RESIDENT pages
             // (e.g. pages allocated before list was populated, or list overflow)
@@ -5793,7 +5794,8 @@ static void *bg_compressor(void *arg) {
             if(is_zero) {
                 page_cdata[i] = (uint8_t*)ZERO_COMPRESSED;
                 page_csz[i] = 8;
-            } else if (tensor_sparse_byte_eligible(s, tc[i]) || tensor_fp16_split_eligible(s, tc[i])) {
+            } else if (tensor_sparse_byte_eligible(s, tc[i]) || tensor_fp16_split_eligible(s, tc[i]) ||
+                       s->meta[tc[i]].tensor_role == MEMX_TENSOR_ROLE_DATA) {
                 tensor_work[n_tensor_work++] = i;
             } else {
                 if (n_tensor_work > 0) {
@@ -5866,17 +5868,38 @@ static void *bg_compressor(void *arg) {
         if(gpu_nc > 0) {
             int gr=gpu_compress(s,gpu_nc);
             if(gr!=0){
-                pthread_mutex_lock(&s->alloc_mutex);
-                for(size_t i=0;i<nc;i++) if(page_valid[i]) restore_compressing_page(s, tc[i]);
-                pthread_mutex_unlock(&s->alloc_mutex);
-                struct timespec ts={0,100000000}; nanosleep(&ts,NULL); continue;
-            }
+                size_t cpu_ok = 0;
+                for(size_t gi=0; gi<gpu_nc; gi++) {
+                    size_t orig_i = gpu_map[gi];
+                    uint32_t zcsz = zlib_page_compress(s->tmp_src + gi*PAGE_SZ, s->tmp_dst + gi*PAGE_SZ, PAGE_SZ);
+                    if (zcsz > 0 && zcsz < PAGE_SZ - 32) {
+                        page_cdata[orig_i] = s->tmp_dst + gi*PAGE_SZ;
+                        page_csz[orig_i] = zcsz;
+                        page_codec[orig_i] = MEMX_CODEC_ZLIB;
+                        cpu_ok++;
+                    } else {
+                        page_valid[orig_i] = 0;
+                    }
+                }
+                if (cpu_ok < gpu_nc) {
+                    pthread_mutex_lock(&s->alloc_mutex);
+                    for(size_t gi=0; gi<gpu_nc; gi++) {
+                        size_t orig_i = gpu_map[gi];
+                        if (!page_valid[orig_i]) {
+                            s->meta[tc[orig_i]].stable_ticks = 8;
+                            restore_compressing_page(s, tc[orig_i]);
+                        }
+                    }
+                    pthread_mutex_unlock(&s->alloc_mutex);
+                }
+            } else {
             // Map GPU output back to original page indices
             for(size_t gi=0; gi<gpu_nc; gi++) {
                 size_t orig_i = gpu_map[gi];
                 page_cdata[orig_i] = s->tmp_dst + gi*PAGE_SZ;
                 page_csz[orig_i] = s->tmp_sz[gi];
                 page_codec[orig_i] = 0;
+            }
             }
         }
         // Reset idle counter - we had work to do
@@ -6085,7 +6108,7 @@ static inline int is_ours(void *ptr) {
 static int tensor_desc_is_valid(const memx_runtime_tensor_desc_t *desc) {
     if (!desc) return 1;
     if (desc->struct_size != 0 && desc->struct_size < offsetof(memx_runtime_tensor_desc_t, reserved)) return 0;
-    if (desc->role > MEMX_TENSOR_ROLE_TEMPORARY) return 0;
+    if (desc->role > MEMX_TENSOR_ROLE_DATA) return 0;
     if (desc->dtype > MEMX_TENSOR_DTYPE_INT32) return 0;
     if (desc->layout > MEMX_TENSOR_LAYOUT_INTERLEAVED) return 0;
     if (desc->rank > 4) return 0;
@@ -6205,6 +6228,8 @@ static void *memx_alloc_internal(size_t size, uintptr_t owner_tag, int force_man
                 tensor_flags |= MEMX_TENSOR_FLAG_HOT;
             if (tensor_dtype == MEMX_TENSOR_DTYPE_FP16 || tensor_dtype == MEMX_TENSOR_DTYPE_BF16)
                 default_pref = MEMX_CODEC_TENSOR_FP16_SPLIT;
+        } else if (tensor_role == MEMX_TENSOR_ROLE_DATA) {
+            default_pref = MEMX_CODEC_ZLIB;
         }
     }
     for (size_t i=found; i<found+npages; i++) {

@@ -94,7 +94,8 @@ typedef enum memx_runtime_tensor_role {
     MEMX_TENSOR_ROLE_KV_CACHE = 2,
     MEMX_TENSOR_ROLE_ACTIVATION = 3,
     MEMX_TENSOR_ROLE_EMBEDDING = 4,
-    MEMX_TENSOR_ROLE_TEMPORARY = 5
+    MEMX_TENSOR_ROLE_TEMPORARY = 5,
+    MEMX_TENSOR_ROLE_DATA = 6
 } memx_runtime_tensor_role_t;
 
 typedef enum memx_runtime_tensor_dtype {

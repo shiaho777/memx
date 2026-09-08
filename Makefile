@@ -7,15 +7,16 @@ BUILD_DIR = build
 RUNTIME_DYLIB = $(BUILD_DIR)/libmemx_runtime.dylib
 BENCHMARK_DIR = benchmarks
 EXAMPLE_DIR = examples
-RUNTIME_BENCHES = benchmark_runtime_suite bench_context_stress bench_tensor_codecs bench_effective_capacity bench_hot_path_latency bench_materialize bench_capsule
+RUNTIME_BENCHES = benchmark_runtime_suite bench_context_stress bench_tensor_codecs bench_generic bench_effective_capacity bench_hot_path_latency bench_materialize bench_capsule
 RUNTIME_BENCH_BINS = $(addprefix $(BUILD_DIR)/,$(RUNTIME_BENCHES))
 EXPLICIT_TEST = $(BUILD_DIR)/test_explicit_runtime
 COMPRESSING_RACE_TEST = $(BUILD_DIR)/test_compressing_race
 TENSOR_CODEC_TEST = $(BUILD_DIR)/test_tensor_codecs
+GENERIC_TEST = $(BUILD_DIR)/test_generic_engine
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 
-.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-capsule-roundtrip test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -37,6 +38,13 @@ $(TENSOR_CODEC_TEST): tests/test_tensor_codecs.m libmemx3.m include/memx_runtime
 test-tensor-codecs: $(TENSOR_CODEC_TEST)
 	@$(TENSOR_CODEC_TEST)
 
+$(GENERIC_TEST): tests/test_generic_engine.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+test-generic: $(GENERIC_TEST)
+	@$(GENERIC_TEST)
+	@$(GENERIC_TEST) --cpu-only
+
 $(EMBEDDED_EXAMPLE): $(EXAMPLE_DIR)/embedded_runtime_demo.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
@@ -48,6 +56,9 @@ $(BUILD_DIR)/bench_context_stress: $(BENCHMARK_DIR)/bench_context_stress.c inclu
 
 $(BUILD_DIR)/bench_tensor_codecs: $(BENCHMARK_DIR)/bench_tensor_codecs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/bench_generic: $(BENCHMARK_DIR)/bench_generic.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime -lz
 
 $(BUILD_DIR)/bench_effective_capacity: $(BENCHMARK_DIR)/bench_effective_capacity.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
@@ -111,6 +122,9 @@ benchmark-stress: $(BUILD_DIR)/bench_context_stress
 benchmark-tensor-codecs: $(BUILD_DIR)/bench_tensor_codecs
 	@$(BUILD_DIR)/bench_tensor_codecs
 
+benchmark-generic: $(BUILD_DIR)/bench_generic
+	@$(BUILD_DIR)/bench_generic
+
 benchmark-effective-capacity: $(BUILD_DIR)/bench_effective_capacity
 	@$(BUILD_DIR)/bench_effective_capacity
 
@@ -123,7 +137,7 @@ benchmark-materialize: $(BUILD_DIR)/bench_materialize
 benchmark-capsule: $(BUILD_DIR)/bench_capsule
 	@$(BUILD_DIR)/bench_capsule
 
-test: test-explicit test-compressing-race test-tensor-codecs example-embedded
+test: test-explicit test-compressing-race test-tensor-codecs test-generic example-embedded
 
 clean:
 	rm -rf $(BUILD_DIR)
