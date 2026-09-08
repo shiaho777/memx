@@ -7,14 +7,15 @@ BUILD_DIR = build
 RUNTIME_DYLIB = $(BUILD_DIR)/libmemx_runtime.dylib
 BENCHMARK_DIR = benchmarks
 EXAMPLE_DIR = examples
-RUNTIME_BENCHES = benchmark_runtime_suite bench_context_stress bench_tensor_codecs bench_effective_capacity bench_hot_path_latency
+RUNTIME_BENCHES = benchmark_runtime_suite bench_context_stress bench_tensor_codecs bench_effective_capacity bench_hot_path_latency bench_materialize bench_capsule
 RUNTIME_BENCH_BINS = $(addprefix $(BUILD_DIR)/,$(RUNTIME_BENCHES))
 EXPLICIT_TEST = $(BUILD_DIR)/test_explicit_runtime
 COMPRESSING_RACE_TEST = $(BUILD_DIR)/test_compressing_race
+TENSOR_CODEC_TEST = $(BUILD_DIR)/test_tensor_codecs
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 
-.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency
+.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-capsule-roundtrip test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -29,6 +30,12 @@ $(EXPLICIT_TEST): tests/test_explicit_runtime.c include/memx_runtime.h $(RUNTIME
 
 $(COMPRESSING_RACE_TEST): tests/test_compressing_race.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+$(TENSOR_CODEC_TEST): tests/test_tensor_codecs.m libmemx3.m include/memx_runtime.h | $(BUILD_DIR)
+	MEMX_NO_SELFTEST=1 $(CC) $(CFLAGS) $(CPPFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $<
+
+test-tensor-codecs: $(TENSOR_CODEC_TEST)
+	@$(TENSOR_CODEC_TEST)
 
 $(EMBEDDED_EXAMPLE): $(EXAMPLE_DIR)/embedded_runtime_demo.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
@@ -46,6 +53,12 @@ $(BUILD_DIR)/bench_effective_capacity: $(BENCHMARK_DIR)/bench_effective_capacity
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
 $(BUILD_DIR)/bench_hot_path_latency: $(BENCHMARK_DIR)/bench_hot_path_latency.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+$(BUILD_DIR)/bench_materialize: $(BENCHMARK_DIR)/bench_materialize.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+$(BUILD_DIR)/bench_capsule: $(BENCHMARK_DIR)/bench_capsule.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
 benchmarks: $(RUNTIME_BENCH_BINS)
@@ -70,6 +83,9 @@ test-weight-archive: $(RUNTIME_DYLIB)
 test-materialize: $(RUNTIME_DYLIB)
 	@python3 tests/test_materialize_bitexact.py
 
+test-capsule-roundtrip: $(RUNTIME_DYLIB)
+	@python3 tests/test_capsule_roundtrip.py
+
 test-python-transformer: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_transformer_lifecycle.py
 
@@ -79,7 +95,7 @@ test-python-torch-transformer: $(RUNTIME_DYLIB)
 test-python-torch-pressure: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_torch_pressure.py
 
-test-python: test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure
+test-python: test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure test-capsule-roundtrip
 
 examples: $(EMBEDDED_EXAMPLE)
 
@@ -101,7 +117,13 @@ benchmark-effective-capacity: $(BUILD_DIR)/bench_effective_capacity
 benchmark-hot-path-latency: $(BUILD_DIR)/bench_hot_path_latency
 	@$(BUILD_DIR)/bench_hot_path_latency
 
-test: test-explicit test-compressing-race example-embedded
+benchmark-materialize: $(BUILD_DIR)/bench_materialize
+	@$(BUILD_DIR)/bench_materialize
+
+benchmark-capsule: $(BUILD_DIR)/bench_capsule
+	@$(BUILD_DIR)/bench_capsule
+
+test: test-explicit test-compressing-race test-tensor-codecs example-embedded
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -1,8 +1,14 @@
 # MemX — ~100× Lower LLM Memory on Apple, Original Precision
 
+[![CI](https://github.com/shiaho777/memx/actions/workflows/ci.yml/badge.svg)](https://github.com/shiaho777/memx/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-macOS%2013%2B%20%C2%B7%20Apple%20Silicon-2563EB)
+![License](https://img.shields.io/badge/license-MIT-059669)
+
 **Run LLMs on Apple Silicon with far less memory — without quantizing weights, without changing numerics, and without treating the model as a permanent multi‑gigabyte RSS bill.**
 
 MemX is a bit-exact compressed-memory runtime for Mac. Cold weight pages leave the hot process surface as a durable **capability plane** (vault + capsule). Inference streams only a working set. BF16 / FP16 / FP32 bytes round-trip unchanged.
+
+<p align="center"><img src="docs/assets/hero.svg" alt="MemX concept: host weights flow through the MemX runtime into a compressed capability-plane capsule, with the three measured memory planes and the bitexact gate" width="720"></p>
 
 On **Qwen3.5‑0.8B** FullHost (~1.66 GB weights), stable measured planes center on a **~100×** headline:
 
@@ -13,6 +19,8 @@ On **Qwen3.5‑0.8B** FullHost (~1.66 GB weights), stable measured planes center
 | **Vessel capability** | Capsule attach + materialize process (no Torch) | **~300×** (~5 MB class) |
 
 `~100×` is the stable center of those three planes — not a claim that every `ps` RSS sample collapses. macOS can still show large **external / COW** file-cache residency; that is OS accounting, not “weights must live as process RAM.”
+
+<p align="center"><img src="docs/assets/planes-bars.svg" alt="Bar chart comparing measured memory planes on the 0.8B workload: 1,660 MB logical weights, ~180 MB phys footprint, ~16 MB engine cold, ~5 MB vessel RSS" width="720"></p>
 
 **Correctness gate:** FullHost output sum **`-24.360558`** (bitexact).
 
@@ -93,6 +101,8 @@ Capability plane (SCR)
   lite attach · materialize_rank · ultralite vessel
 ```
 
+<p align="center"><img src="docs/assets/arch-stack.svg" alt="Layered MemX architecture: host, control plane, page state machine, vault-native compressed pool, and SCR capability plane" width="720"></p>
+
 | Piece | Path |
 |-------|------|
 | C API | [`include/memx_runtime.h`](include/memx_runtime.h) |
@@ -117,6 +127,8 @@ Compress path:
 3. Abort on dirty / `write_seq` change after mutation
 
 Decompress uses TLS scratch. Race coverage: `test_compressing_race`.
+
+<p align="center"><img src="docs/assets/pagefsm-tree.svg" alt="Page lifecycle decision flow: resident pages enter compressing and commit via CAS, dirty pages abort back to resident, compressed pages return on fault or materialize" width="720"></p>
 
 Operational rules that matter for FullHost:
 
@@ -164,6 +176,8 @@ Prefetch caps follow pool pressure and stay separate from hot growth.
 5. Post-infer fold + **phoenix seal** for engine-cold surface
 6. Optional **ultralite vessel**: attach → `materialize_rank` → capability RSS
 
+<p align="center"><img src="docs/assets/fullhost-lanes.svg" alt="FullHost timeline showing load, compress, export, infer, seal and vessel phases with the sliding hot window, prefetch staging and retire trail" width="720"></p>
+
 ### Capability plane (SCR)
 
 | File | Role |
@@ -177,6 +191,8 @@ Prefetch caps follow pool pressure and stay separate from hot growth.
 | Full | Ledger mapped in process | Host-side tooling |
 | **Lite** | Ledger on demand via `pread` | Default vessel / host bind |
 | **Rank** | `materialize_rank` / dense pidx→rank | Fast materialize without binary search |
+
+<p align="center"><img src="docs/assets/capsule-modes.svg" alt="SCR capsule layout: spill.bin, ledger.bin and rank.map files alongside full, lite and rank attach modes" width="720"></p>
 
 ```c
 memx_runtime_capsule_export(dir, &bytes);
@@ -238,6 +254,8 @@ Workload: Qwen3.5‑0.8B FullHost, bitexact **`-24.360558`**, Apple Silicon.
 | Engine cold | **~100×** |
 | Vessel RSS | **~5 MB → ~300×** capability plane |
 | Capsule export | milliseconds when `clone=1` |
+
+<p align="center"><img src="docs/assets/statcards.svg" alt="Stat cards with real repository counts: source lines, C API entry points, codecs, env knobs, tests, benchmarks, bitexact gate value and infer wall" width="720"></p>
 
 ### How to cite numbers
 

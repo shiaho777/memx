@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+  <rect x="0" y="0" width="880" height="420" fill="#FFFFFF"/>
+
+  <rect x="24" y="24" width="208" height="176" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="128" y="50" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Host process</text>
+  <rect x="40" y="64" width="176" height="84" rx="8" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="128" y="88" text-anchor="middle" font-size="10.5" fill="#475569">BF16 · FP16 · FP32 weights</text>
+  <text x="128" y="106" text-anchor="middle" font-size="10.5" fill="#475569">contexts · quotas</text>
+  <text x="128" y="124" text-anchor="middle" font-size="10.5" fill="#475569">epoch + WS intents</text>
+  <text x="128" y="186" text-anchor="middle" font-size="10" fill="#94A3B8">Torch FullHost — run_qwen.py</text>
+
+  <path d="M234 99 H268" stroke="#94A3B8" stroke-width="2"/>
+  <polygon points="268,93 268,105 278,99" fill="#94A3B8"/>
+
+  <rect x="280" y="24" width="232" height="176" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="396" y="50" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">MemX runtime</text>
+  <rect x="296" y="64" width="200" height="84" rx="8" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="396" y="88" text-anchor="middle" font-size="10.5" fill="#475569">RESIDENT → COMPRESSED</text>
+  <text x="396" y="106" text-anchor="middle" font-size="10.5" fill="#475569">tensor codecs · Metal assist</text>
+  <text x="396" y="124" text-anchor="middle" font-size="10.5" fill="#475569">working-set orchestrator</text>
+  <text x="396" y="186" text-anchor="middle" font-size="10" fill="#94A3B8">cold pages compress — bitexact round-trip</text>
+
+  <path d="M514 99 H548" stroke="#94A3B8" stroke-width="2"/>
+  <polygon points="548,93 548,105 558,99" fill="#94A3B8"/>
+
+  <rect x="560" y="24" width="296" height="176" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="708" y="50" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Capability plane (SCR)</text>
+  <rect x="576" y="64" width="264" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="584" y="79" font-size="10.5" fill="#5B21B6"><tspan font-weight="700">spill.bin</tspan><tspan fill="#475569"> · compressed page fabric</tspan></text>
+  <rect x="576" y="94" width="264" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="584" y="109" font-size="10.5" fill="#5B21B6"><tspan font-weight="700">ledger.bin</tspan><tspan fill="#475569"> · page catalog</tspan></text>
+  <rect x="576" y="124" width="264" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="584" y="139" font-size="10.5" fill="#5B21B6"><tspan font-weight="700">rank.map</tspan><tspan fill="#475569"> · dense O(1) rank index</tspan></text>
+  <text x="708" y="186" text-anchor="middle" font-size="10" fill="#94A3B8">lite attach · materialize_rank · ultralite vessel</text>
+
+  <rect x="24" y="220" width="832" height="176" rx="12" fill="#FFFBEB" stroke="#F59E0B"/>
+  <text x="440" y="254" text-anchor="middle" font-size="14" font-weight="700" fill="#92400E">Original precision in — identical bytes out</text>
+  <text x="440" y="274" text-anchor="middle" font-size="10.5" fill="#B45309">Qwen3.5-0.8B FullHost · weights ≈ 1.66 GB · output sum −24.360558 (bitexact gate)</text>
+
+  <rect x="88" y="296" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+  <text x="208" y="326" text-anchor="middle" font-size="14" font-weight="700" fill="#1D4ED8">~9×</text>
+  <text x="208" y="348" text-anchor="middle" font-size="10" fill="#64748B">phys footprint · ~180 MB</text>
+  <rect x="352" y="296" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+  <text x="472" y="326" text-anchor="middle" font-size="14" font-weight="700" fill="#6D28D9">~100×</text>
+  <text x="472" y="348" text-anchor="middle" font-size="10" fill="#64748B">engine cold · ~16 MB</text>
+  <rect x="616" y="296" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+  <text x="736" y="326" text-anchor="middle" font-size="14" font-weight="700" fill="#047857">~300×</text>
+  <text x="736" y="348" text-anchor="middle" font-size="10" fill="#64748B">vessel RSS · ~5 MB</text>
+</svg>
