@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <dlfcn.h>
 #include <malloc/malloc.h>
 #include <mach-o/dyld.h>
@@ -236,8 +237,12 @@ typedef struct {
     id<MTLCommandQueue>         queue;
     id<MTLComputePipelineState> comp_pipe;
     id<MTLComputePipelineState> decomp_pipe;
-    volatile uint64_t  faults;      volatile uint64_t  compressions;
-    volatile uint64_t  bytes_saved; volatile int       running;
+    // Hottest counters get their own cache lines: fault handler, bg compressor
+    // and encode workers RMW these concurrently.
+    _Alignas(64) volatile uint64_t  faults;
+    volatile uint64_t  compressions;
+    volatile uint64_t  bytes_saved;
+    _Alignas(64) volatile int       running;
     volatile int       attached;    pthread_t          bg_thread;
     volatile uint64_t  tensor_codec_pages;
     volatile uint64_t  tensor_codec_bytes_saved;
@@ -278,6 +283,7 @@ typedef struct {
     uint32_t           *pool_free_sz;
     uint32_t            pool_free_count;
     uint32_t            pool_free_cap;
+    uint64_t            pool_free_bytes; // running total of free extent bytes, O(1) pressure calc
     volatile uint64_t   pool_reclaim_bytes_total;
     volatile uint64_t   pool_reclaim_events;
     // Predictive prefetch: detect sequential access and prefetch ahead
@@ -499,11 +505,10 @@ static void pool_release_physical_range(MemXZone3 *s, uint64_t off, uint64_t sz)
     if (end <= start) return;
     uint8_t *pa = s->pool + start;
     size_t bytes = (size_t)(end - start);
-#if defined(MADV_FREE_REUSABLE)
-    madvise(pa, bytes, MADV_FREE_REUSABLE);
-#endif
 #if defined(MADV_DONTNEED)
     madvise(pa, bytes, MADV_DONTNEED);
+#elif defined(MADV_FREE_REUSABLE)
+    madvise(pa, bytes, MADV_FREE_REUSABLE);
 #elif defined(MADV_FREE)
     madvise(pa, bytes, MADV_FREE);
 #endif
@@ -541,7 +546,6 @@ static void pool_pageout_range(MemXZone3 *s, uint64_t off, uint64_t sz) {
 static void pool_pageout_live_locked(MemXZone3 *s) {
     if (!s || !s->pool) return;
     if (s->pool_next > 0) {
-        pool_pageout_range(s, 0, s->pool_next);
         pool_pageout_range(s, 0, s->pool_next);
     }
 }
@@ -2857,6 +2861,7 @@ static void pool_trim_tail_locked(MemXZone3 *s) {
         uint64_t old_next = s->pool_next;
         s->pool_next = off;
         s->pool_free_count--;
+        s->pool_free_bytes -= sz;
         if (old_next > off) pool_release_physical_range(s, off, old_next - off);
     }
 }
@@ -2874,6 +2879,7 @@ static int pool_free_insert_locked(MemXZone3 *s, uint64_t off, uint32_t sz) {
         uint64_t prev_off = s->pool_free_off[pos - 1];
         uint32_t prev_sz = s->pool_free_sz[pos - 1];
         if (prev_off + prev_sz == off) {
+            s->pool_free_bytes -= prev_sz;
             off = prev_off;
             sz += prev_sz;
             pos--;
@@ -2888,6 +2894,7 @@ static int pool_free_insert_locked(MemXZone3 *s, uint64_t off, uint32_t sz) {
         uint64_t next_off = s->pool_free_off[pos];
         uint32_t next_sz = s->pool_free_sz[pos];
         if (off + sz == next_off) {
+            s->pool_free_bytes -= next_sz;
             sz += next_sz;
             memmove(&s->pool_free_off[pos], &s->pool_free_off[pos + 1],
                     (s->pool_free_count - (pos + 1)) * sizeof(*s->pool_free_off));
@@ -2905,6 +2912,7 @@ static int pool_free_insert_locked(MemXZone3 *s, uint64_t off, uint32_t sz) {
     s->pool_free_off[pos] = off;
     s->pool_free_sz[pos] = sz;
     s->pool_free_count++;
+    s->pool_free_bytes += sz;
     pool_trim_tail_locked(s);
     return 0;
 }
@@ -2920,9 +2928,11 @@ static int pool_alloc_extent_locked(MemXZone3 *s, uint32_t sz, uint64_t *out_off
             memmove(&s->pool_free_sz[i], &s->pool_free_sz[i + 1],
                     (s->pool_free_count - (i + 1)) * sizeof(*s->pool_free_sz));
             s->pool_free_count--;
+            s->pool_free_bytes -= sz;
         } else {
             s->pool_free_off[i] += sz;
             s->pool_free_sz[i] -= sz;
+            s->pool_free_bytes -= sz;
         }
         *out_off = off;
         return 0;
@@ -2951,7 +2961,7 @@ static uint64_t pool_largest_free_extent_locked(MemXZone3 *s) {
 
 static uint32_t memx_pool_pressure_percent_locked(MemXZone3 *s) {
     if (!s || s->pool_size == 0) return 0;
-    uint64_t free_extent_bytes = pool_free_extent_bytes_locked(s);
+    uint64_t free_extent_bytes = s->pool_free_bytes;
     uint64_t packed = s->pool_used;
     uint64_t live = s->pool_next > free_extent_bytes ? s->pool_next - free_extent_bytes : 0;
     uint64_t used = packed > live ? packed : live;
@@ -2965,6 +2975,18 @@ static uint32_t memx_pool_near_full_locked(MemXZone3 *s) {
     if (occupancy >= 95) return 1;
     uint64_t headroom = s->pool_size > s->pool_next ? (s->pool_size - s->pool_next) : 0;
     if (headroom * 20ULL <= s->pool_size) return 1;
+    return 0;
+}
+
+typedef struct { uint64_t off; uint32_t sz; } pool_live_t;
+
+static int pool_live_cmp(const void *a, const void *b) {
+    const pool_live_t *x = (const pool_live_t *)a;
+    const pool_live_t *y = (const pool_live_t *)b;
+    if (x->off < y->off) return -1;
+    if (x->off > y->off) return 1;
+    if (x->sz < y->sz) return -1;
+    if (x->sz > y->sz) return 1;
     return 0;
 }
 
@@ -2985,11 +3007,6 @@ static uint64_t pool_compact_locked(MemXZone3 *s) {
         uint64_t off = m->pool_offset;
         uint32_t sz = m->comp_size;
         if (sz == 0 || off + (uint64_t)sz > s->pool_size) continue;
-        int exists = 0;
-        for (size_t i = 0; i < nlive; i++) {
-            if (live[i].off == off && live[i].sz == sz) { exists = 1; break; }
-        }
-        if (exists) continue;
         if (nlive >= cap) {
             size_t ncap = cap * 2;
             pool_live_t *nl = (pool_live_t *)realloc(live, sizeof(pool_live_t) * ncap);
@@ -3002,24 +3019,26 @@ static uint64_t pool_compact_locked(MemXZone3 *s) {
         nlive++;
     }
 
+    qsort(live, nlive, sizeof(live[0]), pool_live_cmp);
+    if (nlive > 1) {
+        size_t w = 1;
+        for (size_t i = 1; i < nlive; i++) {
+            if (live[i].off != live[w - 1].off || live[i].sz != live[w - 1].sz) {
+                live[w++] = live[i];
+            }
+        }
+        nlive = w;
+    }
+
     if (nlive == 0) {
         free(live);
         uint64_t old_next = s->pool_next;
         s->pool_next = 0;
         s->pool_free_count = 0;
+        s->pool_free_bytes = 0;
         s->pool_used = 0;
         if (old_next) pool_release_physical_range(s, 0, old_next < s->pool_size ? old_next : s->pool_size);
         return old_next;
-    }
-
-    for (size_t i = 1; i < nlive; i++) {
-        pool_live_t key = live[i];
-        size_t j = i;
-        while (j > 0 && live[j - 1].off > key.off) {
-            live[j] = live[j - 1];
-            j--;
-        }
-        live[j] = key;
     }
 
     uint64_t *old_off = (uint64_t *)malloc(sizeof(uint64_t) * nlive);
@@ -3058,17 +3077,20 @@ static uint64_t pool_compact_locked(MemXZone3 *s) {
         if (s->dedup_ref[i] == 0 || s->dedup_sz[i] == 0) continue;
         uint64_t off = s->dedup_off[i];
         uint32_t sz = s->dedup_sz[i];
-        for (size_t j = 0; j < nlive; j++) {
-            if (old_off[j] == off && live[j].sz == sz) {
-                if (s->dedup_rev && s->dedup_rev_size) {
-                    uint32_t old_pp = (uint32_t)(off / PAGE_SZ) & s->dedup_rev_mask;
-                    if (s->dedup_rev[old_pp] == i + 1) s->dedup_rev[old_pp] = 0;
-                    uint32_t new_pp = (uint32_t)(new_off[j] / PAGE_SZ) & s->dedup_rev_mask;
-                    s->dedup_rev[new_pp] = (i) + 1;
-                }
-                s->dedup_off[i] = new_off[j];
-                break;
+        size_t lo = 0, hi = nlive;
+        while (lo < hi) {
+            size_t mid = lo + ((hi - lo) >> 1);
+            if (old_off[mid] < off) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < nlive && old_off[lo] == off && live[lo].sz == sz) {
+            if (s->dedup_rev && s->dedup_rev_size) {
+                uint32_t old_pp = (uint32_t)(off / PAGE_SZ) & s->dedup_rev_mask;
+                if (s->dedup_rev[old_pp] == i + 1) s->dedup_rev[old_pp] = 0;
+                uint32_t new_pp = (uint32_t)(new_off[lo] / PAGE_SZ) & s->dedup_rev_mask;
+                s->dedup_rev[new_pp] = (i) + 1;
             }
+            s->dedup_off[i] = new_off[lo];
         }
     }
 
@@ -3078,17 +3100,21 @@ static uint64_t pool_compact_locked(MemXZone3 *s) {
         if (m->state != PAGE_COMPRESSED && m->state != PAGE_HOT && m->state != PAGE_COMPRESSING) continue;
         uint64_t off = m->pool_offset;
         uint32_t sz = m->comp_size;
-        for (size_t j = 0; j < nlive; j++) {
-            if (old_off[j] == off && live[j].sz == sz) {
-                m->pool_offset = new_off[j];
-                break;
-            }
+        size_t lo = 0, hi = nlive;
+        while (lo < hi) {
+            size_t mid = lo + ((hi - lo) >> 1);
+            if (old_off[mid] < off) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < nlive && old_off[lo] == off && live[lo].sz == sz) {
+            m->pool_offset = new_off[lo];
         }
     }
 
     uint64_t old_next = s->pool_next;
     s->pool_next = cursor;
     s->pool_free_count = 0;
+    s->pool_free_bytes = 0;
     s->pool_used = cursor;
     if (old_next > cursor) pool_release_physical_range(s, cursor, old_next - cursor);
     if (s->pool_next < s->pool_size) pool_release_physical_range(s, s->pool_next, s->pool_size - s->pool_next);
@@ -3233,11 +3259,10 @@ static inline int page_stable_need(const PageMeta *m) {
 static inline void page_release_physical(MemXZone3 *s, size_t page) {
     if (!s) return;
     uint8_t *pa = (uint8_t*)s->vmem + page * PAGE_SZ;
-#if defined(MADV_FREE_REUSABLE)
-    madvise(pa, PAGE_SZ, MADV_FREE_REUSABLE);
-#endif
 #if defined(MADV_DONTNEED)
     madvise(pa, PAGE_SZ, MADV_DONTNEED);
+#elif defined(MADV_FREE_REUSABLE)
+    madvise(pa, PAGE_SZ, MADV_FREE_REUSABLE);
 #elif defined(MADV_FREE)
     madvise(pa, PAGE_SZ, MADV_FREE);
 #endif
@@ -3249,11 +3274,10 @@ static inline void page_release_physical_range(MemXZone3 *s, size_t first, size_
     size_t n = last_inclusive - first + 1;
     uint8_t *pa = (uint8_t*)s->vmem + first * PAGE_SZ;
     size_t bytes = n * PAGE_SZ;
-#if defined(MADV_FREE_REUSABLE)
-    madvise(pa, bytes, MADV_FREE_REUSABLE);
-#endif
 #if defined(MADV_DONTNEED)
     madvise(pa, bytes, MADV_DONTNEED);
+#elif defined(MADV_FREE_REUSABLE)
+    madvise(pa, bytes, MADV_FREE_REUSABLE);
 #elif defined(MADV_FREE)
     madvise(pa, bytes, MADV_FREE);
 #endif
@@ -3348,10 +3372,11 @@ static void meta_release_physical_range(MemXZone3 *s, size_t first, size_t last_
     uintptr_t a0 = ((uintptr_t)&s->meta[first]) & ~((uintptr_t)PAGE_SZ - 1);
     uintptr_t a1 = ((uintptr_t)&s->meta[last_inclusive] + sizeof(PageMeta) + PAGE_SZ - 1) & ~((uintptr_t)PAGE_SZ - 1);
     if (a1 <= a0) return;
-#if defined(MADV_FREE_REUSABLE)
+#if defined(MADV_DONTNEED)
+    madvise((void*)a0, a1 - a0, MADV_DONTNEED);
+#elif defined(MADV_FREE_REUSABLE)
     madvise((void*)a0, a1 - a0, MADV_FREE_REUSABLE);
 #endif
-    madvise((void*)a0, a1 - a0, MADV_DONTNEED);
 }
 
 // ─── Free bitmap helpers ───
@@ -3376,24 +3401,33 @@ static inline int bm_is_free(MemXZone3 *s, size_t page) {
 }
 static inline ssize_t bm_find_free_run(MemXZone3 *s, size_t npages, size_t hint) {
     size_t total = s->npages;
-    for (size_t start = hint; start < total; ) {
-        uint64_t used = s->free_bm[start / 64];
-        uint64_t free_bits = ~used;
-        if (free_bits == 0) { start = (start / 64 + 1) * 64; continue; }
-        size_t base = start & ~63ULL;
-        size_t bit_off = start - base;
-        uint64_t masked = free_bits >> bit_off;
-        if (masked == 0) { start = base + 64; continue; }
-        int bit = __builtin_ctzll(masked) + (int)bit_off;
-        size_t found = base + bit;
-        if (found >= total) return -1;
-        size_t cont = 0;
-        for (size_t j = found; j < total && cont < npages; j++) {
-            if (bm_is_free(s, j)) cont++;
-            else break;
+    size_t start = hint;
+    while (start < total) {
+        size_t wi = start / 64;
+        uint64_t free_bits = ~s->free_bm[wi];
+        free_bits &= ~0ULL << (start % 64);
+        if (free_bits == 0) { start = (wi + 1) * 64; continue; }
+        size_t run_start = wi * 64 + __builtin_ctzll(free_bits);
+        if (run_start >= total) return -1;
+        // Count consecutive free pages word-by-word
+        size_t run_end = run_start;
+        size_t wj = run_start / 64;
+        uint64_t w = s->free_bm[wj] | (~0ULL << (run_start % 64));  // used=1 mask beyond start
+        while (1) {
+            uint64_t inv = ~w;
+            if (inv == 0) {
+                run_end = (wj + 1) * 64;
+                if (run_end >= total) { run_end = total; break; }
+                wj++;
+                w = s->free_bm[wj];
+            } else {
+                run_end = wj * 64 + __builtin_ctzll(inv);
+                if (run_end > total) run_end = total;
+                break;
+            }
         }
-        if (cont >= npages) return (ssize_t)found;
-        start = found + cont + 1;
+        if (run_end - run_start >= npages) return (ssize_t)run_start;
+        start = run_end + 1;
     }
     return -1;
 }
@@ -3553,9 +3587,13 @@ static int page_bytes_equal(const uint8_t *a, const uint8_t *b) {
 #endif
 }
 
-static inline int page_compress_content_ok(MemXZone3 *s, size_t pidx, uint32_t seq0, const uint8_t *snap) {
+static inline int page_compress_meta_stable(MemXZone3 *s, size_t pidx, uint32_t seq0) {
     PageMeta *m = &s->meta[pidx];
-    if (m->state != PAGE_COMPRESSING || m->dirty || m->write_seq != seq0) return 0;
+    return m->state == PAGE_COMPRESSING && !m->dirty && m->write_seq == seq0;
+}
+
+static inline int page_compress_content_ok(MemXZone3 *s, size_t pidx, uint32_t seq0, const uint8_t *snap) {
+    if (!page_compress_meta_stable(s, pidx, seq0)) return 0;
     return page_bytes_equal(snap, (const uint8_t *)s->vmem + pidx * PAGE_SZ);
 }
 
@@ -3698,6 +3736,19 @@ static uint32_t tensor_fp16_delta_split_compress(const uint8_t *src, uint8_t *ds
 static uint32_t tensor_bitplane16_compress(const uint8_t *src, uint8_t *dst, uint32_t cap) {
     if (!src || !dst || cap < 34) return 0;
     uint8_t planes[16][PAGE_SZ / 16];
+#if MEMX_HAS_NEON
+    {
+        const uint16x8_t lane_w = {1, 2, 4, 8, 16, 32, 64, 128};
+        for (uint32_t i = 0; i < PAGE_SZ / 2; i += 8) {
+            uint16x8_t v = vld1q_u16((const uint16_t *)(src + i * 2));
+            uint32_t byte_i = i >> 3;
+            for (uint32_t b = 0; b < 16; b++) {
+                uint16x8_t tst = vtstq_u16(v, vdupq_n_u16((uint16_t)(1u << b)));
+                planes[b][byte_i] = (uint8_t)vaddvq_u16(vandq_u16(tst, lane_w));
+            }
+        }
+    }
+#else
     memset(planes, 0, sizeof(planes));
     for (uint32_t i = 0; i < PAGE_SZ / 2; i += 8) {
         uint16_t v[8];
@@ -3717,6 +3768,7 @@ static uint32_t tensor_bitplane16_compress(const uint8_t *src, uint8_t *dst, uin
             planes[b][byte_i] = byte;
         }
     }
+#endif
     uint32_t op = 36;
     dst[0] = 0x4D;
     dst[1] = 0x58;
@@ -3989,6 +4041,23 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
     memset(sign_raw, 0, sign_bytes);
     memset(mant_raw, 0, mant_len);
     if (is_bf16) {
+#if MEMX_HAS_NEON
+        const uint16x8_t lane_w = {1, 2, 4, 8, 16, 32, 64, 128};
+        const uint16x8_t sign_bit = vdupq_n_u16(0x8000u);
+        const uint16x8_t mant_mask = vdupq_n_u16(0x7Fu);
+        for (uint32_t i = 0; i < half_count; i += 8) {
+            uint16x8_t h = vld1q_u16((const uint16_t *)(src + i * 2));
+            uint16x8_t st = vtstq_u16(h, sign_bit);
+            sign_raw[i >> 3] = (uint8_t)vaddvq_u16(vandq_u16(st, lane_w));
+            vst1_u8(exp_raw + i, vmovn_u16(vshrq_n_u16(h, 7)));
+            uint8_t mb[8];
+            vst1_u8(mb, vmovn_u16(vandq_u16(h, mant_mask)));
+            uint64_t packed = (uint64_t)mb[0] | ((uint64_t)mb[1] << 7) | ((uint64_t)mb[2] << 14) |
+                              ((uint64_t)mb[3] << 21) | ((uint64_t)mb[4] << 28) | ((uint64_t)mb[5] << 35) |
+                              ((uint64_t)mb[6] << 42) | ((uint64_t)mb[7] << 49);
+            memcpy(mant_raw + (size_t)(i >> 3) * 7, &packed, 7);
+        }
+#else
         uint32_t bit_pos = 0;
         for (uint32_t i = 0; i < half_count; i++) {
             uint16_t h = (uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8);
@@ -4001,7 +4070,29 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
                 bit_pos++;
             }
         }
+#endif
     } else {
+#if MEMX_HAS_NEON
+        const uint16x8_t lane_w = {1, 2, 4, 8, 16, 32, 64, 128};
+        const uint16x8_t sign_bit = vdupq_n_u16(0x8000u);
+        const uint16x8_t exp_mask = vdupq_n_u16(0x1Fu);
+        const uint16x8_t mant_mask = vdupq_n_u16(0x3FFu);
+        for (uint32_t i = 0; i < half_count; i += 8) {
+            uint16x8_t h = vld1q_u16((const uint16_t *)(src + i * 2));
+            uint16x8_t st = vtstq_u16(h, sign_bit);
+            sign_raw[i >> 3] = (uint8_t)vaddvq_u16(vandq_u16(st, lane_w));
+            vst1_u8(exp_raw + i, vmovn_u16(vandq_u16(vshrq_n_u16(h, 10), exp_mask)));
+            uint16_t mw[8];
+            vst1q_u16(mw, vandq_u16(h, mant_mask));
+            uint64_t w0 = (uint64_t)mw[0] | ((uint64_t)mw[1] << 10) | ((uint64_t)mw[2] << 20) |
+                          ((uint64_t)mw[3] << 30) | ((uint64_t)mw[4] << 40) | ((uint64_t)mw[5] << 50) |
+                          ((uint64_t)mw[6] << 60);
+            uint16_t w1 = (uint16_t)((mw[6] >> 4) | (uint16_t)(mw[7] << 6));
+            uint8_t *mo = mant_raw + (size_t)(i >> 3) * 10;
+            memcpy(mo, &w0, 8);
+            memcpy(mo + 8, &w1, 2);
+        }
+#else
         uint32_t bit_pos = 0;
         for (uint32_t i = 0; i < half_count; i++) {
             uint16_t h = (uint16_t)src[i * 2] | ((uint16_t)src[i * 2 + 1] << 8);
@@ -4014,6 +4105,7 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
                 bit_pos++;
             }
         }
+#endif
     }
     const uint32_t hdr = 28;
     if (cap <= hdr + sign_bytes + mant_len + 32) return 0;
@@ -4023,7 +4115,8 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
     if (rem_for_sign < 8) return 0;
     if (sign_bound > rem_for_sign) sign_bound = rem_for_sign;
     uLongf sign_len = sign_bound;
-    int rc = compress2(sign_out, &sign_len, sign_raw, sign_bytes, 1);
+    int prev_deflate_lv = memx_deflate_level_push(1);
+    int rc = memx_deflate_once(sign_raw, sign_bytes, sign_out, &sign_len);
     uint8_t sign_raw_store = 0;
     if (rc != Z_OK || sign_len == 0 || sign_len >= sign_bytes) {
         memcpy(sign_out, sign_raw, sign_bytes);
@@ -4032,12 +4125,18 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
     }
     uint8_t *exp_out = sign_out + sign_len;
     uint32_t rem = cap - (uint32_t)(exp_out - dst) - mant_len;
-    if (rem < 16) return 0;
+    if (rem < 16) {
+        (void)memx_deflate_level_push(prev_deflate_lv);
+        return 0;
+    }
     uLongf exp_bound = compressBound(half_count);
     if (exp_bound > rem) exp_bound = rem;
     uLongf exp_len = exp_bound;
-    rc = compress2(exp_out, &exp_len, exp_raw, half_count, 1);
-    if (rc != Z_OK || exp_len == 0 || exp_len >= half_count) return 0;
+    rc = memx_deflate_once(exp_raw, half_count, exp_out, &exp_len);
+    if (rc != Z_OK || exp_len == 0 || exp_len >= half_count) {
+        (void)memx_deflate_level_push(prev_deflate_lv);
+        return 0;
+    }
     uint8_t *mant_out = exp_out + exp_len;
     uint8_t mant_raw_store = 1;
     uLongf mant_len_z = mant_len;
@@ -4046,12 +4145,13 @@ static uint32_t tensor_exp_pack_compress(const uint8_t *src, uint8_t *dst, uint3
     if (mant_bound > rem_m) mant_bound = rem_m;
     if (mant_bound >= 16) {
         uLongf zlen = mant_bound;
-        rc = compress2(mant_out, &zlen, mant_raw, mant_len, 1);
+        rc = memx_deflate_once(mant_raw, mant_len, mant_out, &zlen);
         if (rc == Z_OK && zlen > 0 && zlen + 32 < mant_len) {
             mant_len_z = zlen;
             mant_raw_store = 0;
         }
     }
+    (void)memx_deflate_level_push(prev_deflate_lv);
     if (mant_raw_store) {
         if (mant_len > rem_m) return 0;
         memcpy(mant_out, mant_raw, mant_len);
@@ -4151,6 +4251,21 @@ static void cpu_decompress(const uint8_t *src, uint32_t cs, uint8_t *dst) {
             if(ip+sz>cs||rle8_decode(src+ip,sz,planes[b],PAGE_SZ/16)!=0){memset(dst,0,PAGE_SZ);return;}
             ip+=sz;
         }
+#if MEMX_HAS_NEON
+        {
+            const uint8x8_t bit_sel = {1, 2, 4, 8, 16, 32, 64, 128};
+            for(uint32_t i=0;i<PAGE_SZ/2;i+=8){
+                uint32_t byte_i=i>>3;
+                uint16x8_t acc=vdupq_n_u16(0);
+                for(uint32_t b=0;b<16;b++){
+                    uint8x8_t pv=vdup_n_u8(planes[b][byte_i]);
+                    uint16x8_t m=vmovl_s8(vreinterpret_s8_u8(vtst_u8(pv,bit_sel)));
+                    acc=vorrq_u16(acc,vandq_u16(m,vdupq_n_u16((uint16_t)(1u<<b))));
+                }
+                vst1q_u16((uint16_t*)(dst+i*2),acc);
+            }
+        }
+#else
         for(uint32_t i=0;i<PAGE_SZ/2;i+=8){
             uint32_t byte_i=i>>3;
             uint16_t out[8]={0,0,0,0,0,0,0,0};
@@ -4168,6 +4283,7 @@ static void cpu_decompress(const uint8_t *src, uint32_t cs, uint8_t *dst) {
             }
             memcpy(dst+i*2,out,16);
         }
+#endif
         return;
     }
     if(ver==MEMX_CODEC_TENSOR_SPARSE_BYTE){
@@ -4225,6 +4341,41 @@ static void cpu_decompress(const uint8_t *src, uint32_t cs, uint8_t *dst) {
             if(uncompress(mant_raw,&destLen,p,mant_zlen)!=Z_OK||destLen!=mant_len){memset(dst,0,PAGE_SZ);return;}
         }
         if(flags & 4u){
+#if MEMX_HAS_NEON
+            const uint8x8_t bit_sel = {1, 2, 4, 8, 16, 32, 64, 128};
+            const uint16x8_t exp_mask5 = vdupq_n_u16(0x1Fu);
+            for(uint32_t i=0;i<half_count;i+=8){
+                uint8x8_t sv=vdup_n_u8(sign_raw[i>>3]);
+                uint16x8_t sign16=vandq_u16(vmovl_s8(vreinterpret_s8_u8(vtst_u8(sv,bit_sel))),vdupq_n_u16(0x8000u));
+                uint16x8_t exp16=vmovl_u8(vld1_u8(exp_raw+i));
+                uint16_t mw[8];
+                if(is_bf16){
+                    uint64_t packed=0;
+                    memcpy(&packed,mant_raw+(size_t)(i>>3)*7,7);
+                    for(int j=0;j<8;j++) mw[j]=(uint16_t)((packed>>(7*j))&0x7Fu);
+                }else{
+                    uint64_t w0; uint16_t w1=0;
+                    memcpy(&w0,mant_raw+(size_t)(i>>3)*10,8);
+                    memcpy(&w1,mant_raw+(size_t)(i>>3)*10+8,2);
+                    mw[0]=(uint16_t)(w0&0x3FFu);
+                    mw[1]=(uint16_t)((w0>>10)&0x3FFu);
+                    mw[2]=(uint16_t)((w0>>20)&0x3FFu);
+                    mw[3]=(uint16_t)((w0>>30)&0x3FFu);
+                    mw[4]=(uint16_t)((w0>>40)&0x3FFu);
+                    mw[5]=(uint16_t)((w0>>50)&0x3FFu);
+                    mw[6]=(uint16_t)(((w0>>60)|((uint64_t)w1<<4))&0x3FFu);
+                    mw[7]=(uint16_t)((w1>>6)&0x3FFu);
+                }
+                uint16x8_t mant16=vld1q_u16(mw);
+                uint16x8_t h;
+                if(is_bf16){
+                    h=vorrq_u16(sign16,vorrq_u16(vshlq_n_u16(exp16,7),mant16));
+                }else{
+                    h=vorrq_u16(sign16,vorrq_u16(vshlq_n_u16(vandq_u16(exp16,exp_mask5),10),mant16));
+                }
+                vst1q_u16((uint16_t*)(dst+i*2),h);
+            }
+#else
             uint32_t bit_pos = 0;
             for(uint32_t i=0;i<half_count;i++){
                 uint16_t sign=(sign_raw[i>>3]>>(i&7u))&1u;
@@ -4247,6 +4398,7 @@ static void cpu_decompress(const uint8_t *src, uint32_t cs, uint8_t *dst) {
                 dst[i*2]=(uint8_t)(h&0xFF);
                 dst[i*2+1]=(uint8_t)((h>>8)&0xFF);
             }
+#endif
         }else{
             for(uint32_t i=0;i<half_count;i++){
                 uint16_t sign=(sign_raw[i>>3]>>(i&7u))&1u;
@@ -4364,8 +4516,13 @@ static int gpu_compress(MemXZone3 *s, size_t count) {
     [enc setBuffer:s->gpu_sb offset:0 atIndex:0];[enc setBuffer:s->gpu_db offset:0 atIndex:1];[enc setBuffer:s->gpu_zb offset:0 atIndex:2];
     [enc dispatchThreadgroups:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
     [enc endEncoding];[cb commit];[cb waitUntilCompleted];
-    memcpy(s->tmp_dst,[s->gpu_db contents],bytes);
-    memcpy(s->tmp_sz,[s->gpu_zb contents],count*4);
+    const uint32_t *zs = (const uint32_t *)[s->gpu_zb contents];
+    const uint8_t *gd = (const uint8_t *)[s->gpu_db contents];
+    for (size_t i = 0; i < count; i++) {
+        uint32_t z = zs[i];
+        s->tmp_sz[i] = z;
+        if (z > 0 && z <= PAGE_SZ) memcpy(s->tmp_dst + i*PAGE_SZ, gd + i*PAGE_SZ, z);
+    }
     return 0;
 }
 
@@ -4392,6 +4549,25 @@ static void dedup_decref(MemXZone3 *s, uint64_t pool_offset, uint32_t comp_size)
                 s->dedup_pending_free[i] = 1;
                 __sync_fetch_and_add(&s->dedup_pending_free_count, 1);
             }
+            return;
+        }
+    }
+}
+
+static void dedup_incref(MemXZone3 *s, uint64_t pool_offset, uint32_t comp_size) {
+    if (!s->dedup_rev || s->dedup_rev_size == 0) return;
+    uint32_t pp = (uint32_t)(pool_offset / PAGE_SZ) & s->dedup_rev_mask;
+    uint32_t slot1 = s->dedup_rev[pp];
+    if (slot1 > 0 && slot1 <= DEDUP_HT_SIZE) {
+        uint32_t slot = slot1 - 1;
+        if (s->dedup_ref[slot] > 0 && s->dedup_off[slot] == pool_offset && s->dedup_sz[slot] == comp_size) {
+            __sync_fetch_and_add(&s->dedup_ref[slot], 1);
+            return;
+        }
+    }
+    for (uint32_t i = 0; i < DEDUP_HT_SIZE; i++) {
+        if (s->dedup_ref[i] > 0 && s->dedup_off[i] == pool_offset && s->dedup_sz[i] == comp_size) {
+            __sync_fetch_and_add(&s->dedup_ref[i], 1);
             return;
         }
     }
@@ -4436,16 +4612,18 @@ static uint64_t pool_reclaim_pending_locked(MemXZone3 *s) {
 
 static void wait_decompress_complete(PageMeta *m) {
     if (!m) return;
-    for (int i = 0; i < 1000000; i++) {
-        uint8_t st = m->state;
-        uint32_t cs = m->comp_size;
+    // Never give up: returning while an install is still in flight lets the
+    // caller write into a page whose content is not final yet. Atomic loads
+    // are required here - plain loads get hoisted out of the loop by the
+    // optimizer, which spins forever on a stale value.
+    for (;;) {
+        uint8_t st = __atomic_load_n(&m->state, __ATOMIC_ACQUIRE);
+        uint32_t cs = __atomic_load_n(&m->comp_size, __ATOMIC_ACQUIRE);
         if (st != PAGE_HOT && st != PAGE_COMPRESSED) return;
         if (st == PAGE_HOT && cs == 0) return;
         if (st == PAGE_COMPRESSED) return;
 #if defined(__aarch64__)
-        __asm__ __volatile__("yield");
-#else
-        ;
+        __asm__ __volatile__("yield" ::: "memory");
 #endif
     }
 }
@@ -4467,6 +4645,8 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
         if (st != PAGE_COMPRESSED) return 0;
         uint64_t d_off = 0;
         uint32_t d_sz = 0;
+        int spill_direct = 0;
+        int served = 0;
         pthread_mutex_lock(&s->alloc_mutex);
         if (m->state != PAGE_COMPRESSED) {
             pthread_mutex_unlock(&s->alloc_mutex);
@@ -4484,15 +4664,28 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
         d_off = m->pool_offset;
         d_sz = m->comp_size;
         if (d_sz > 0 && d_sz <= PAGE_SZ) {
-            if ((pool_is_vault_native(s) || s->pool_detached) && s->pool_spill_fd > 2) {
-                if (pool_copy_blob_locked(s, d_off, d_sz, g_comp_payload) != 0) {
-                    m->state = PAGE_COMPRESSED;
-                    __sync_fetch_and_add(&s->live_compressed_pages, 1);
-                    if (s->live_resident_pages) __sync_fetch_and_sub(&s->live_resident_pages, 1);
-                    pthread_mutex_unlock(&s->alloc_mutex);
-                    return 0;
+            int have_spill = (s->pool_spill_fd > 2 && s->pool_spill_bytes >= d_off + (uint64_t)d_sz);
+            if (have_spill && (pool_is_vault_native(s) || s->pool_detached)) {
+                if (pool_is_vault_native(s)) {
+                    if (pool_vault_cache_get_locked(s, d_off, d_sz, g_comp_payload)) {
+                        served = 1;
+                    } else {
+                        (void)pool_vault_wbuf_flush_locked(s);
+                        const uint8_t *wp = pool_vault_window_ptr_locked(s, d_off, d_sz);
+                        if (wp) {
+                            memcpy(g_comp_payload, wp, d_sz);
+                            s->pool_vault_reads++;
+                            pool_vault_cache_put_locked(s, d_off, d_sz, g_comp_payload);
+                            served = 1;
+                        } else {
+                            spill_direct = 1;
+                        }
+                    }
+                } else {
+                    spill_direct = 1;
                 }
-            } else {
+                if (served) dedup_decref(s, d_off, d_sz);
+            } else if (s->pool && !s->pool_detached) {
                 uint64_t p0 = d_off & ~((uint64_t)PAGE_SZ - 1);
                 uint64_t p1 = (d_off + d_sz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
                 if (p1 > s->pool_size) p1 = s->pool_size;
@@ -4502,10 +4695,37 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
                         (void)mprotect(s->pool + p0, bytes, PROT_READ | PROT_WRITE);
                 }
                 memcpy(g_comp_payload, s->pool + d_off, d_sz);
+                served = 1;
+                dedup_decref(s, d_off, d_sz);
+            } else if (have_spill) {
+                spill_direct = 1;
+            }
+            if (!served && !spill_direct) {
+                m->state = PAGE_COMPRESSED;
+                __sync_fetch_and_add(&s->live_compressed_pages, 1);
+                if (s->live_resident_pages) __sync_fetch_and_sub(&s->live_resident_pages, 1);
+                pthread_mutex_unlock(&s->alloc_mutex);
+                return 0;
             }
         }
-        if (d_sz > 0 && d_sz <= PAGE_SZ) dedup_decref(s, d_off, d_sz);
         pthread_mutex_unlock(&s->alloc_mutex);
+        if (spill_direct) {
+            ssize_t r = pread(s->pool_spill_fd, g_comp_payload, d_sz, (off_t)d_off);
+            pthread_mutex_lock(&s->alloc_mutex);
+            if (r != (ssize_t)d_sz) {
+                m->state = PAGE_COMPRESSED;
+                __sync_fetch_and_add(&s->live_compressed_pages, 1);
+                if (s->live_resident_pages) __sync_fetch_and_sub(&s->live_resident_pages, 1);
+                pthread_mutex_unlock(&s->alloc_mutex);
+                return 0;
+            }
+            if (pool_is_vault_native(s)) {
+                s->pool_vault_reads++;
+                pool_vault_cache_put_locked(s, d_off, d_sz, g_comp_payload);
+            }
+            dedup_decref(s, d_off, d_sz);
+            pthread_mutex_unlock(&s->alloc_mutex);
+        }
 
         uint8_t *pa = (uint8_t *)s->vmem + page_index * PAGE_SZ;
         uint8_t *tmp = g_decomp_scratch;
@@ -5030,8 +5250,8 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         else if (pressure >= 60 && sticky_good > (PAGE_SZ * 7 / 16))
             sticky_good = PAGE_SZ * 7 / 16;
     }
+    uint32_t sticky_csz = 0;
     if (sticky_ok) {
-        uint32_t sticky_csz = 0;
         if (preferred == MEMX_CODEC_TENSOR_SPARSE_BYTE && try_sparse)
             sticky_csz = tensor_sparse_byte_compress(src, tensor_dst, PAGE_SZ);
         else if (preferred == MEMX_CODEC_TENSOR_EXP_PACK && try_fp16)
@@ -5064,7 +5284,13 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
     if (need_compete) {
         uint32_t best_csz = tensor_csz;
         uint8_t best_codec = tensor_codec;
-        if (try_sparse) {
+        // Sticky already ran `preferred`; its outcome is in best_* (or it
+        // failed deterministically), so skip re-running that codec.
+        uint8_t sticky_ran = (sticky_ok && preferred) ? preferred : 0;
+        uint32_t zsplit_csz = 0;
+        int zsplit_done = 0;
+        if (sticky_ran == MEMX_CODEC_TENSOR_FP16_ZLIB_SPLIT) { zsplit_done = 1; zsplit_csz = sticky_csz; }
+        if (try_sparse && sticky_ran != MEMX_CODEC_TENSOR_SPARSE_BYTE) {
             uint32_t sparse_csz = tensor_sparse_byte_compress(src, codec_tmp, PAGE_SZ);
             if (sparse_csz > 0 && (best_csz == 0 || sparse_csz < best_csz)) {
                 best_csz = sparse_csz;
@@ -5072,7 +5298,7 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
                 memcpy(tensor_dst, codec_tmp, sparse_csz);
             }
         }
-        if (try_fp16 &&
+        if (try_fp16 && sticky_ran != MEMX_CODEC_TENSOR_EXP_PACK &&
             (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish)) {
             uint32_t expz = tensor_exp_pack_compress(src, codec_tmp, PAGE_SZ, is_bf16);
             if (expz > 0 && (best_csz == 0 || expz < best_csz)) {
@@ -5084,15 +5310,19 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         if (try_fp16 &&
             (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
              role == MEMX_TENSOR_ROLE_KV_CACHE)) {
-            uint32_t zsplit = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
-            if (zsplit > 0 && (best_csz == 0 || zsplit < best_csz)) {
-                best_csz = zsplit;
+            if (!zsplit_done) {
+                zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
+                zsplit_done = 1;
+            }
+            if (zsplit_csz > 0 && (best_csz == 0 || zsplit_csz < best_csz)) {
+                best_csz = zsplit_csz;
                 best_codec = MEMX_CODEC_TENSOR_FP16_ZLIB_SPLIT;
-                memcpy(tensor_dst, codec_tmp, zsplit);
+                memcpy(tensor_dst, codec_tmp, zsplit_csz);
             }
         }
-        if (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
-            role == MEMX_TENSOR_ROLE_KV_CACHE) {
+        if (sticky_ran != MEMX_CODEC_ZLIB &&
+            (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
+             role == MEMX_TENSOR_ROLE_KV_CACHE)) {
             uint32_t zcsz = zlib_page_compress(src, codec_tmp, PAGE_SZ);
             if (zcsz > 0 && (best_csz == 0 || zcsz < best_csz)) {
                 best_csz = zcsz;
@@ -5100,7 +5330,7 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
                 memcpy(tensor_dst, codec_tmp, zcsz);
             }
         }
-        if (try_delta) {
+        if (try_delta && sticky_ran != MEMX_CODEC_TENSOR_FP16_DELTA_SPLIT) {
             uint32_t delta_split_csz = tensor_fp16_delta_split_compress(src, codec_tmp, PAGE_SZ);
             if (delta_split_csz > 0 && (best_csz == 0 || delta_split_csz < best_csz)) {
                 best_csz = delta_split_csz;
@@ -5108,7 +5338,7 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
                 memcpy(tensor_dst, codec_tmp, delta_split_csz);
             }
         }
-        if (try_fp16) {
+        if (try_fp16 && sticky_ran != MEMX_CODEC_TENSOR_FP16_SPLIT) {
             uint32_t split_csz = tensor_fp16_split_compress(src, codec_tmp, PAGE_SZ);
             if (split_csz > 0 && (best_csz == 0 || split_csz < best_csz)) {
                 best_csz = split_csz;
@@ -5116,7 +5346,7 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
                 memcpy(tensor_dst, codec_tmp, split_csz);
             }
         }
-        if (try_bitplane &&
+        if (try_bitplane && sticky_ran != MEMX_CODEC_TENSOR_BITPLANE16 &&
             (best_csz == 0 || best_csz > (PAGE_SZ * 5 / 8)) &&
             (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
              role == MEMX_TENSOR_ROLE_KV_CACHE)) {
@@ -5130,11 +5360,14 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         if (best_csz > 0) {
             if ((role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING) &&
                 best_codec == MEMX_CODEC_TENSOR_EXP_PACK) {
-                uint32_t zsplit = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
-                if (zsplit > 0 && zsplit <= (best_csz + (best_csz / 8) + 64)) {
-                    best_csz = zsplit;
+                if (!zsplit_done) {
+                    zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
+                    zsplit_done = 1;
+                }
+                if (zsplit_csz > 0 && zsplit_csz <= (best_csz + (best_csz / 8) + 64)) {
+                    best_csz = zsplit_csz;
                     best_codec = MEMX_CODEC_TENSOR_FP16_ZLIB_SPLIT;
-                    memcpy(tensor_dst, codec_tmp, zsplit);
+                    memcpy(tensor_dst, codec_tmp, zsplit_csz);
                 }
             }
             tensor_csz = best_csz;
@@ -5491,9 +5724,8 @@ static void *bg_compressor(void *arg) {
                     hot_list_add(s, (uint32_t)pidx);
                     continue;
                 }
-                uint8_t *srcp = (uint8_t*)s->vmem+pidx*PAGE_SZ;
-                uint8_t *dstp = s->tmp_src+k*PAGE_SZ;
                 if ((s->meta[pidx].tensor_flags & MEMX_TENSOR_FLAG_SEQUENTIAL) != 0) {
+                    uint8_t *srcp = (uint8_t*)s->vmem+pidx*PAGE_SZ;
                     mprotect(srcp, PAGE_SZ, PROT_NONE);
                     __sync_synchronize();
                     mprotect(srcp, PAGE_SZ, PROT_READ);
@@ -5507,11 +5739,21 @@ static void *bg_compressor(void *arg) {
                         continue;
                     }
                 }
+                page_seq[k] = seq0;
+                page_valid[k] = 2;
+            }
+            pthread_mutex_unlock(&s->alloc_mutex);
+            for(size_t k=i; k<j; k++) {
+                if (page_valid[k] != 2) continue;
+                page_valid[k] = 0;
+                size_t pidx = tc[k];
+                uint32_t seq0 = page_seq[k];
+                uint8_t *srcp = (uint8_t*)s->vmem+pidx*PAGE_SZ;
+                uint8_t *dstp = s->tmp_src+k*PAGE_SZ;
                 memcpy(dstp, srcp, PAGE_SZ);
                 __sync_synchronize();
                 if (!page_compress_content_ok(s, pidx, seq0, dstp)) {
-                    if (s->meta[pidx].state == PAGE_COMPRESSING) {
-                        s->meta[pidx].state = PAGE_HOT;
+                    if (__sync_val_compare_and_swap(&s->meta[pidx].state, PAGE_COMPRESSING, PAGE_HOT) == PAGE_COMPRESSING) {
                         s->meta[pidx].cooldown = 6;
                         hot_list_add(s, (uint32_t)pidx);
                     }
@@ -5519,10 +5761,8 @@ static void *bg_compressor(void *arg) {
                     mprotect(srcp, PAGE_SZ, PROT_READ|PROT_WRITE);
                     continue;
                 }
-                page_seq[k] = seq0;
                 page_valid[k] = 1;
             }
-            pthread_mutex_unlock(&s->alloc_mutex);
             i = j;
         }
         // Zero-page fast path: detect all-zero pages before GPU compress
@@ -6204,7 +6444,7 @@ static void init_memx(void) {
     g_z->gpu_sb = nil;
     g_z->gpu_db = nil;
     g_z->gpu_zb = nil;
-    g_z->batch_cap = 32;
+    g_z->batch_cap = 128;
     size_t batch_bytes = g_z->batch_cap * PAGE_SZ;
     g_z->tmp_src = (uint8_t*)mmap(NULL, batch_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     g_z->tmp_dst = (uint8_t*)mmap(NULL, batch_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
@@ -7939,41 +8179,30 @@ int memx_runtime_context_export_archive(memx_runtime_context_t *ctx, void *ptr, 
             uint64_t off = m->pool_offset;
             uint8_t *buf = (uint8_t *)malloc(csz);
             if (!buf) { rc = ENOMEM; break; }
-            pthread_mutex_lock(&g_z->alloc_mutex);
-            if (off + csz <= g_z->pool_size) {
-                pool_prepare_write_range(g_z, off, csz);
-                memcpy(buf, g_z->pool + off, csz);
-                {
-                    uint64_t start = off & ~((uint64_t)PAGE_SZ - 1);
-                    uint64_t end = (off + csz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
-                    if (end > g_z->pool_size) end = g_z->pool_size;
-                    if (end > start) mprotect(g_z->pool + start, (size_t)(end - start), PROT_READ);
-                }
-            } else {
-                free(buf);
-                buf = NULL;
-            }
-            pthread_mutex_unlock(&g_z->alloc_mutex);
-            if (!buf) {
-                force_compress_page_now(g_z, pidx);
-                m = &g_z->meta[pidx];
-                if ((m->state == PAGE_COMPRESSED || m->state == PAGE_HOT) && m->comp_size > 0) {
-                    csz = m->comp_size;
-                    off = m->pool_offset;
-                    buf = (uint8_t *)malloc(csz);
-                    if (!buf) { rc = ENOMEM; break; }
-                    pthread_mutex_lock(&g_z->alloc_mutex);
-                    pool_prepare_write_range(g_z, off, csz);
-                    memcpy(buf, g_z->pool + off, csz);
-                    {
-                        uint64_t start = off & ~((uint64_t)PAGE_SZ - 1);
-                        uint64_t end = (off + csz + PAGE_SZ - 1) & ~((uint64_t)PAGE_SZ - 1);
-                        if (end > g_z->pool_size) end = g_z->pool_size;
-                        if (end > start) mprotect(g_z->pool + start, (size_t)(end - start), PROT_READ);
-                    }
-                    pthread_mutex_unlock(&g_z->alloc_mutex);
-                }
-            }
+	            pthread_mutex_lock(&g_z->alloc_mutex);
+	            if (off + csz <= g_z->pool_size && pool_copy_blob_locked(g_z, off, csz, buf) == 0) {
+	                // successfully copied compressed blob (from pool RAM or spill file)
+	            } else {
+	                free(buf);
+	                buf = NULL;
+	            }
+	            pthread_mutex_unlock(&g_z->alloc_mutex);
+	            if (!buf) {
+	                force_compress_page_now(g_z, pidx);
+	                m = &g_z->meta[pidx];
+	                if ((m->state == PAGE_COMPRESSED || m->state == PAGE_HOT) && m->comp_size > 0) {
+	                    csz = m->comp_size;
+	                    off = m->pool_offset;
+	                    buf = (uint8_t *)malloc(csz);
+	                    if (!buf) { rc = ENOMEM; break; }
+	                    pthread_mutex_lock(&g_z->alloc_mutex);
+	                    if (off + csz > g_z->pool_size || pool_copy_blob_locked(g_z, off, csz, buf) != 0) {
+	                        free(buf);
+	                        buf = NULL;
+	                    }
+	                    pthread_mutex_unlock(&g_z->alloc_mutex);
+	                }
+	            }
             if (buf) {
                 ents[i].comp_size = csz;
                 ents[i].codec = m->codec;
@@ -9749,6 +9978,9 @@ typedef struct {
     uint64_t materialize_batch_pages;
     memx_capsule_ent_t *ents;
     size_t ents_bytes;
+    uint64_t rank_win_base;
+    uint32_t rank_win_count;
+    memx_cap_rank_t rank_win[341];
     char dir[512];
 } memx_capsule_rt_t;
 
@@ -9805,10 +10037,6 @@ static int capsule_spill_publish(int src_fd, const char *dst_path, uint64_t byte
     if (fcntl(src_fd, F_GETPATH, src_path) == 0 && src_path[0]) {
         if (clonefile(src_path, dst_path, 0) == 0) {
             if (out_cloned) *out_cloned = 1;
-            return 0;
-        }
-        if (link(src_path, dst_path) == 0) {
-            if (out_cloned) *out_cloned = 2;
             return 0;
         }
     }
@@ -10160,6 +10388,8 @@ int memx_runtime_capsule_attach(const char *dirpath) {
     g_cap.lite = lite;
     g_cap.rank_fd = -1;
     g_cap.has_rank = 0;
+    g_cap.rank_win_base = 0;
+    g_cap.rank_win_count = 0;
     g_cap.spill_bytes = hdr.spill_bytes;
     g_cap.ent_count = hdr.ent_count;
     g_cap.page_sz = hdr.page_sz ? hdr.page_sz : PAGE_SZ;
@@ -10233,8 +10463,23 @@ static int capsule_rank_load(uint64_t rank, uint32_t *out_csz, uint64_t *out_off
     if (rank >= g_cap.ent_count) return -1;
     if (g_cap.has_rank && g_cap.rank_fd >= 0) {
         memx_cap_rank_t r;
-        off_t off = (off_t)(16ull + rank * sizeof(memx_cap_rank_t));
-        if (pread(g_cap.rank_fd, &r, sizeof(r), off) != (ssize_t)sizeof(r)) return -1;
+        if (rank >= g_cap.rank_win_base &&
+            rank < g_cap.rank_win_base + (uint64_t)g_cap.rank_win_count) {
+            r = g_cap.rank_win[rank - g_cap.rank_win_base];
+        } else {
+            off_t off = (off_t)(16ull + rank * sizeof(memx_cap_rank_t));
+            uint32_t want = (uint32_t)((g_cap.ent_count - rank) < 341ull ? (g_cap.ent_count - rank) : 341ull);
+            if (pread(g_cap.rank_fd, g_cap.rank_win, (size_t)want * sizeof(memx_cap_rank_t), off)
+                    != (ssize_t)((size_t)want * sizeof(memx_cap_rank_t))) {
+                if (pread(g_cap.rank_fd, &r, sizeof(r), off) != (ssize_t)sizeof(r)) return -1;
+                g_cap.rank_win_base = 0;
+                g_cap.rank_win_count = 0;
+            } else {
+                g_cap.rank_win_base = rank;
+                g_cap.rank_win_count = want;
+                r = g_cap.rank_win[0];
+            }
+        }
         if (r.csz == 0 || r.csz > PAGE_SZ) return -1;
         uint64_t o = ((uint64_t)r.off_hi << 32) | (uint64_t)r.off_lo;
         if (o + (uint64_t)r.csz > g_cap.spill_bytes) return -1;
@@ -10248,6 +10493,53 @@ static int capsule_rank_load(uint64_t rank, uint32_t *out_csz, uint64_t *out_off
     if (e.off + (uint64_t)e.csz > g_cap.spill_bytes) return -1;
     if (out_csz) *out_csz = e.csz;
     if (out_off) *out_off = e.off;
+    return 0;
+}
+
+static int capsule_rank_load_dense_v(uint64_t base_rank, uint32_t n,
+                                     uint32_t *out_csz, uint64_t *out_off) {
+    if (!out_csz || !out_off) return -1;
+    if (base_rank + (uint64_t)n > g_cap.ent_count) return -1;
+    if (!(g_cap.has_rank && g_cap.rank_fd >= 0 && g_cap.dense)) {
+        for (uint32_t k = 0; k < n; k++) {
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+        }
+        return 0;
+    }
+    uint64_t need = (uint64_t)n * sizeof(memx_cap_rank_t);
+    if (need > (1u << 20)) {
+        for (uint32_t k = 0; k < n; k++) {
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+        }
+        return 0;
+    }
+    memx_cap_rank_t *rs = (memx_cap_rank_t *)malloc((size_t)need);
+    if (!rs) {
+        for (uint32_t k = 0; k < n; k++) {
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+        }
+        return 0;
+    }
+    off_t off = (off_t)(16ull + base_rank * sizeof(memx_cap_rank_t));
+    ssize_t got = pread(g_cap.rank_fd, rs, (size_t)need, off);
+    if (got != (ssize_t)need) {
+        free(rs);
+        for (uint32_t k = 0; k < n; k++) {
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+        }
+        return 0;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t csz = rs[k].csz;
+        uint64_t o = ((uint64_t)rs[k].off_hi << 32) | (uint64_t)rs[k].off_lo;
+        if (csz == 0 || csz > PAGE_SZ || o + (uint64_t)csz > g_cap.spill_bytes) {
+            free(rs);
+            return -1;
+        }
+        out_csz[k] = csz;
+        out_off[k] = o;
+    }
+    free(rs);
     return 0;
 }
 
@@ -10293,23 +10585,88 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
     if (!g_cap.live || g_cap.spill_fd < 0) return ENOENT;
     enum { CAP_BATCH_MAX = 512 };
     if (n > CAP_BATCH_MAX) n = CAP_BATCH_MAX;
-    cap_batch_item_t items[CAP_BATCH_MAX];
+    cap_batch_item_t *items = (cap_batch_item_t *)malloc(sizeof(cap_batch_item_t) * CAP_BATCH_MAX);
+    if (!items) return ENOMEM;
     uint32_t m = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const memx_capsule_ent_t *e = capsule_find_ent(pidxs[i]);
-        if (!e || e->csz == 0 || e->csz > PAGE_SZ) continue;
-        if (e->off + (uint64_t)e->csz > g_cap.spill_bytes) continue;
-        items[m].off = e->off;
-        items[m].csz = e->csz;
-        items[m].pidx = e->pidx;
-        items[m].slot = i;
-        m++;
+    int rank_batched = 0;
+    uint32_t rb_csz[CAP_BATCH_MAX];
+    uint64_t rb_off[CAP_BATCH_MAX];
+    uint64_t rmin = 0, rmax = 0;
+    if (g_cap.dense) {
+        int all_in_range = (n > 0);
+        rmin = (uint64_t)-1;
+        rmax = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (pidxs[i] < g_cap.dense_base) { all_in_range = 0; break; }
+            uint64_t r = (uint64_t)pidxs[i] - (uint64_t)g_cap.dense_base;
+            if (r >= g_cap.ent_count) { all_in_range = 0; break; }
+            if (r < rmin) rmin = r;
+            if (r > rmax) rmax = r;
+        }
+        if (all_in_range) {
+            uint64_t span = rmax - rmin + 1ull;
+            if (span <= (1u << 16) &&
+                capsule_rank_load_dense_v(rmin, (uint32_t)span, rb_csz, rb_off) == 0) {
+                rank_batched = 1;
+            }
+        }
+        if (rank_batched) {
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t r = (uint64_t)pidxs[i] - (uint64_t)g_cap.dense_base - rmin;
+                items[m].off = rb_off[r];
+                items[m].csz = rb_csz[r];
+                items[m].pidx = pidxs[i];
+                items[m].slot = i;
+                m++;
+            }
+        }
     }
-    if (m == 0) return ENOENT;
+    if (!rank_batched) {
+        for (uint32_t i = 0; i < n; i++) {
+            const memx_capsule_ent_t *e = capsule_find_ent(pidxs[i]);
+            if (!e || e->csz == 0 || e->csz > PAGE_SZ) continue;
+            if (e->off + (uint64_t)e->csz > g_cap.spill_bytes) continue;
+            items[m].off = e->off;
+            items[m].csz = e->csz;
+            items[m].pidx = e->pidx;
+            items[m].slot = i;
+            m++;
+        }
+    }
+    if (m == 0) { free(items); return ENOENT; }
     if (m > 1) qsort(items, (size_t)m, sizeof(items[0]), capsule_batch_off_cmp);
-    uint8_t stack_payload[PAGE_SZ];
     uint8_t *span_buf = NULL;
     size_t span_cap = 0;
+    // span != NULL: decode from span (base = span_base_off); else per-item pread
+    void (^decode_range)(uint32_t, uint32_t, const uint8_t *, uint64_t) =
+        ^(uint32_t from, uint32_t to, const uint8_t *span, uint64_t span_base_off) {
+        if (to - from == 1) {
+            uint8_t one[PAGE_SZ];
+            const uint8_t *pl = span ? (span + (items[from].off - span_base_off)) : NULL;
+            if (!pl) {
+                if (pread(g_cap.spill_fd, one, items[from].csz, (off_t)items[from].off) != (ssize_t)items[from].csz) return;
+                pl = one;
+            }
+            cpu_decompress(pl, items[from].csz, (uint8_t *)dst + (size_t)items[from].slot * dst_stride);
+            g_cap.materialize_pages++;
+            g_cap.materialize_batch_pages++;
+            g_cap.materialize_bytes += PAGE_SZ;
+            return;
+        }
+        dispatch_apply((size_t)(to - from), DISPATCH_APPLY_AUTO, ^(size_t kk) {
+            uint32_t k = from + (uint32_t)kk;
+            uint8_t one[PAGE_SZ];
+            const uint8_t *pl = span ? (span + (items[k].off - span_base_off)) : NULL;
+            if (!pl) {
+                if (pread(g_cap.spill_fd, one, items[k].csz, (off_t)items[k].off) != (ssize_t)items[k].csz) return;
+                pl = one;
+            }
+            cpu_decompress(pl, items[k].csz, (uint8_t *)dst + (size_t)items[k].slot * dst_stride);
+            __sync_fetch_and_add(&g_cap.materialize_pages, 1);
+            __sync_fetch_and_add(&g_cap.materialize_batch_pages, 1);
+            __sync_fetch_and_add(&g_cap.materialize_bytes, PAGE_SZ);
+        });
+    };
     uint32_t i = 0;
     while (i < m) {
         uint64_t base = items[i].off;
@@ -10332,15 +10689,7 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
         }
         size_t span = (size_t)(run_end - base);
         if (span == 0 || span > (1u << 20) || j == i + 1) {
-            for (uint32_t k = i; k < j; k++) {
-                if (pread(g_cap.spill_fd, stack_payload, items[k].csz, (off_t)items[k].off) != (ssize_t)items[k].csz)
-                    continue;
-                uint8_t *out = (uint8_t *)dst + (size_t)items[k].slot * dst_stride;
-                cpu_decompress(stack_payload, items[k].csz, out);
-                g_cap.materialize_pages++;
-                g_cap.materialize_batch_pages++;
-                g_cap.materialize_bytes += PAGE_SZ;
-            }
+            decode_range(i, j, NULL, 0);
             if (j > i) g_cap.materialize_spans++;
             i = j;
             continue;
@@ -10351,45 +10700,20 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
             if (span_buf == MAP_FAILED) {
                 span_buf = NULL;
                 span_cap = 0;
-                for (uint32_t k = i; k < j; k++) {
-                    if (pread(g_cap.spill_fd, stack_payload, items[k].csz, (off_t)items[k].off) != (ssize_t)items[k].csz)
-                        continue;
-                    uint8_t *out = (uint8_t *)dst + (size_t)items[k].slot * dst_stride;
-                    cpu_decompress(stack_payload, items[k].csz, out);
-                    g_cap.materialize_pages++;
-                    g_cap.materialize_batch_pages++;
-                    g_cap.materialize_bytes += PAGE_SZ;
-                }
-                if (j > i) g_cap.materialize_spans++;
-                i = j;
-                continue;
+            } else {
+                span_cap = span;
             }
-            span_cap = span;
         }
-        if (pread(g_cap.spill_fd, span_buf, span, (off_t)base) != (ssize_t)span) {
-            for (uint32_t k = i; k < j; k++) {
-                if (pread(g_cap.spill_fd, stack_payload, items[k].csz, (off_t)items[k].off) != (ssize_t)items[k].csz)
-                    continue;
-                uint8_t *out = (uint8_t *)dst + (size_t)items[k].slot * dst_stride;
-                cpu_decompress(stack_payload, items[k].csz, out);
-                g_cap.materialize_pages++;
-                g_cap.materialize_batch_pages++;
-                g_cap.materialize_bytes += PAGE_SZ;
-            }
+        if (!span_buf || pread(g_cap.spill_fd, span_buf, span, (off_t)base) != (ssize_t)span) {
+            decode_range(i, j, NULL, 0);
         } else {
             g_cap.materialize_spans++;
-            for (uint32_t k = i; k < j; k++) {
-                uint64_t rel = items[k].off - base;
-                uint8_t *out = (uint8_t *)dst + (size_t)items[k].slot * dst_stride;
-                cpu_decompress(span_buf + rel, items[k].csz, out);
-                g_cap.materialize_pages++;
-                g_cap.materialize_batch_pages++;
-                g_cap.materialize_bytes += PAGE_SZ;
-            }
+            decode_range(i, j, span_buf, base);
         }
         i = j;
     }
     if (span_buf && span_buf != MAP_FAILED) munmap(span_buf, span_cap);
+    free(items);
     return 0;
 }
 
