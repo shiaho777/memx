@@ -1,4 +1,5 @@
 import ctypes
+import threading
 from pathlib import Path
 
 
@@ -61,6 +62,22 @@ CODEC_NAMES = {
     MEMX_RUNTIME_CODEC_TENSOR_FP16_ZLIB_SPLIT: "tensor_fp16_zlib_split",
     MEMX_RUNTIME_CODEC_TENSOR_EXP_PACK: "tensor_exp_pack",
 }
+
+
+class CapsuleStats(ctypes.Structure):
+    _fields_ = [
+        ("ent_count", ctypes.c_uint64),
+        ("spill_bytes", ctypes.c_uint64),
+        ("page_bytes", ctypes.c_uint64),
+        ("ledger_bytes", ctypes.c_uint64),
+        ("materialize_pages", ctypes.c_uint64),
+        ("materialize_bytes", ctypes.c_uint64),
+        ("attached", ctypes.c_int),
+        ("materialize_spans", ctypes.c_uint64),
+        ("materialize_batch_pages", ctypes.c_uint64),
+        ("dense", ctypes.c_int),
+        ("export_clone", ctypes.c_int),
+    ]
 
 
 class Stats(ctypes.Structure):
@@ -250,6 +267,18 @@ class WSTile(ctypes.Structure):
         ("retire_col_start", ctypes.c_size_t),
         ("retire_col_count", ctypes.c_size_t),
     ]
+
+
+_tile_tls = threading.local()
+
+
+def _scratch_tile():
+    tile = getattr(_tile_tls, "tile", None)
+    if tile is None:
+        tile = WSTile()
+        tile.struct_size = ctypes.sizeof(WSTile)
+        _tile_tls.tile = tile
+    return tile
 
 
 
@@ -466,6 +495,7 @@ class Runtime:
     def __init__(self, path=None):
         self.path = Path(path) if path else _default_library_path()
         self.lib = ctypes.CDLL(str(self.path))
+        self._addr_cache = {}
         self._bind()
 
     def _bind(self):
@@ -649,14 +679,24 @@ class Runtime:
         if rc != 0:
             raise OSError(rc, "memx_runtime_capsule_detach failed")
 
+    def _buf_addr(self, buf):
+        key = (id(buf), len(buf))
+        ent = self._addr_cache.get(key)
+        if ent is None:
+            try:
+                arr = (ctypes.c_char * len(buf)).from_buffer(buf)
+            except TypeError:
+                arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+            ent = (arr, ctypes.addressof(arr))
+            if len(self._addr_cache) > 8:
+                self._addr_cache.clear()
+            self._addr_cache[key] = ent
+        return ent[1]
+
     def capsule_materialize_rank(self, rank, buf):
         if not isinstance(buf, (bytearray, memoryview)):
             raise TypeError("buf must be bytearray/memoryview")
-        try:
-            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
-        except TypeError:
-            arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
-            addr = ctypes.addressof(arr)
+        addr = self._buf_addr(buf)
         rc = self.lib.memx_runtime_capsule_materialize_rank(ctypes.c_uint64(int(rank)), ctypes.c_void_p(addr), ctypes.c_size_t(len(buf)))
         if rc != 0:
             raise OSError(rc, "memx_runtime_capsule_materialize_rank failed")
@@ -665,11 +705,7 @@ class Runtime:
     def capsule_materialize(self, pidx, buf):
         if not isinstance(buf, (bytearray, memoryview)):
             raise TypeError("buf must be bytearray/memoryview")
-        try:
-            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
-        except TypeError:
-            arr = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
-            addr = ctypes.addressof(arr)
+        addr = self._buf_addr(buf)
         rc = self.lib.memx_runtime_capsule_materialize(ctypes.c_uint32(int(pidx)), ctypes.c_void_p(addr), ctypes.c_size_t(len(buf)))
         if rc != 0:
             raise OSError(rc, "memx_runtime_capsule_materialize failed")
@@ -685,12 +721,8 @@ class Runtime:
     def capsule_materialize_v(self, pidxs, buf, stride=16384):
         if not isinstance(buf, (bytearray, memoryview)):
             raise TypeError("buf must be bytearray/memoryview")
-        arr = (ctypes.c_uint32 * len(pidxs))(*[int(x) for x in pidxs])
-        try:
-            addr = ctypes.addressof((ctypes.c_char * len(buf)).from_buffer(buf))
-        except TypeError:
-            b = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
-            addr = ctypes.addressof(b)
+        arr = (ctypes.c_uint32 * len(pidxs))(*pidxs)
+        addr = self._buf_addr(buf)
         if not hasattr(self.lib, "memx_runtime_capsule_materialize_v"):
             raise OSError("memx_runtime_capsule_materialize_v missing")
         rc = self.lib.memx_runtime_capsule_materialize_v(arr, ctypes.c_uint32(len(pidxs)), ctypes.c_void_p(addr), ctypes.c_size_t(int(stride)))
@@ -699,20 +731,6 @@ class Runtime:
         return True
 
     def capsule_stats(self):
-        class CapsuleStats(ctypes.Structure):
-            _fields_ = [
-                ("ent_count", ctypes.c_uint64),
-                ("spill_bytes", ctypes.c_uint64),
-                ("page_bytes", ctypes.c_uint64),
-                ("ledger_bytes", ctypes.c_uint64),
-                ("materialize_pages", ctypes.c_uint64),
-                ("materialize_bytes", ctypes.c_uint64),
-                ("attached", ctypes.c_int),
-                ("materialize_spans", ctypes.c_uint64),
-                ("materialize_batch_pages", ctypes.c_uint64),
-                ("dense", ctypes.c_int),
-                ("export_clone", ctypes.c_int),
-            ]
         out = CapsuleStats()
         rc = self.lib.memx_runtime_capsule_stats(ctypes.byref(out))
         if rc != 0:
@@ -915,8 +933,7 @@ class Context:
             raise OSError("materialize_tile unavailable")
         if flags is None:
             flags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT
-        tile = WSTile()
-        tile.struct_size = ctypes.sizeof(WSTile)
+        tile = _scratch_tile()
         tile.flags = 0
         tile.ptr = allocation.ptr
         tile.rows = int(rows)
@@ -1002,9 +1019,12 @@ class Allocation:
         self.ptr = ptr
         self.size = size
         self.name = name
+        self._buffer = None
 
     def buffer(self):
-        return (ctypes.c_uint8 * self.size).from_address(self.ptr.value)
+        if self._buffer is None or len(self._buffer) != self.size:
+            self._buffer = (ctypes.c_uint8 * self.size).from_address(self.ptr.value)
+        return self._buffer
 
     def torch_tensor(self, dtype, shape, stride=None):
         import torch

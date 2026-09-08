@@ -19,7 +19,7 @@ def main():
     ap.add_argument("--batch", type=int, default=1)
     args = ap.parse_args()
     os.environ.setdefault("MEMX_CAPSULE_LITE", "1")
-import memx_runtime as m
+    import memx_runtime as m
     rt = m.Runtime()
     rt.capsule_attach(args.dir)
     st = rt.capsule_stats()
