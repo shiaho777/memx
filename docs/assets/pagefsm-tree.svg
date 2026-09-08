@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+  <rect x="0" y="0" width="880" height="360" fill="#FFFFFF"/>
+  <text x="440" y="30" text-anchor="middle" font-size="13" font-weight="700" fill="#0F172A">Page lifecycle — a page commits only when its bytes still match</text>
+
+  <!-- accepted path -->
+  <circle cx="110" cy="110" r="15" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+  <text x="110" y="115" text-anchor="middle" font-size="11" font-weight="700" fill="#1E3A8A">R</text>
+  <text x="110" y="146" text-anchor="middle" font-size="11" font-weight="700" fill="#1E3A8A">RESIDENT</text>
+  <path d="M127 110 H330" stroke="#475569" stroke-width="1.8"/>
+  <polygon points="330,104 330,116 342,110" fill="#475569"/>
+  <text x="235" y="98" text-anchor="middle" font-size="10.5" fill="#475569">enter COMPRESSING · write meta</text>
+
+  <circle cx="350" cy="110" r="15" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+  <text x="350" y="115" text-anchor="middle" font-size="11" font-weight="700" fill="#92400E">C</text>
+  <text x="350" y="146" text-anchor="middle" font-size="11" font-weight="700" fill="#92400E">COMPRESSING</text>
+  <path d="M367 110 H560" stroke="#059669" stroke-width="1.8"/>
+  <polygon points="560,104 560,116 572,110" fill="#059669"/>
+  <text x="465" y="98" text-anchor="middle" font-size="10.5" font-weight="700" fill="#047857">CAS commit — content still matches</text>
+
+  <circle cx="580" cy="110" r="15" fill="#D1FAE5" stroke="#059669" stroke-width="2"/>
+  <text x="580" y="115" text-anchor="middle" font-size="11" font-weight="700" fill="#065F46">Z</text>
+  <text x="580" y="146" text-anchor="middle" font-size="11" font-weight="700" fill="#065F46">COMPRESSED</text>
+
+  <!-- green return arc: fault / HOT / materialize -->
+  <path d="M580 94 C 450 42, 240 42, 124 94" fill="none" stroke="#059669" stroke-width="1.8"/>
+  <polygon points="132,90 121,86 127,101" fill="#059669"/>
+  <text x="350" y="56" text-anchor="middle" font-size="10.5" fill="#047857">fault / HOT / materialize → resident again</text>
+
+  <!-- abort branch -->
+  <path d="M350 126 V189" stroke="#DC2626" stroke-width="1.8" stroke-dasharray="5 3"/>
+  <circle cx="350" cy="204" r="13" fill="#FEE2E2" stroke="#DC2626" stroke-width="2"/>
+  <text x="350" y="209" text-anchor="middle" font-size="12" font-weight="700" fill="#B91C1C">✗</text>
+  <text x="370" y="200" font-size="10.5" fill="#B91C1C">abort — dirty / write_seq drift</text>
+  <text x="370" y="215" font-size="9.5" fill="#DC2626">page stays RESIDENT, no bytes change</text>
+
+  <!-- gates panel -->
+  <rect x="600" y="160" width="256" height="128" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="616" y="182" font-size="11.5" font-weight="700" fill="#0F172A">Gates</text>
+  <text x="616" y="202" font-size="10" fill="#475569">commit · CAS only if content matches</text>
+  <text x="616" y="219" font-size="10" fill="#475569">abort · write_seq drift / dirty</text>
+  <text x="616" y="236" font-size="10" fill="#475569">decompress · TLS scratch buffer</text>
+  <text x="616" y="253" font-size="10" fill="#475569">materialize · KEEP_COMPRESSED stays cold</text>
+  <text x="616" y="270" font-size="10" fill="#475569">race gate · test_compressing_race</text>
+
+  <text x="440" y="322" text-anchor="middle" font-size="12" font-weight="700" fill="#0F172A">Bytes the host wrote are the bytes decompressed — bitexact by construction</text>
+  <text x="440" y="342" text-anchor="middle" font-size="10" fill="#94A3B8">Incompressible pages store raw — never lossy</text>
+</svg>

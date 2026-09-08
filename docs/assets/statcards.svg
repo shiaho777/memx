@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="150" viewBox="0 0 880 150" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+  <rect x="0" y="0" width="880" height="150" fill="#FFFFFF"/>
+  <rect x="20" y="16" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="120" y="38" text-anchor="middle" font-size="17" font-weight="700" fill="#1D4ED8">21,808</text>
+  <text x="120" y="56" text-anchor="middle" font-size="10.5" fill="#64748B">source lines · C / ObjC / Python</text>
+  <rect x="236" y="16" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="336" y="38" text-anchor="middle" font-size="17" font-weight="700" fill="#6D28D9">69</text>
+  <text x="336" y="56" text-anchor="middle" font-size="10.5" fill="#64748B">C API entry points</text>
+  <rect x="452" y="16" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="552" y="38" text-anchor="middle" font-size="17" font-weight="700" fill="#047857">7</text>
+  <text x="552" y="56" text-anchor="middle" font-size="10.5" fill="#64748B">page codecs (6 tensor + zlib)</text>
+  <rect x="668" y="16" width="192" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="764" y="38" text-anchor="middle" font-size="17" font-weight="700" fill="#B45309">238</text>
+  <text x="764" y="56" text-anchor="middle" font-size="10.5" fill="#64748B">MEMX_* env knobs</text>
+  <rect x="20" y="82" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="120" y="104" text-anchor="middle" font-size="17" font-weight="700" fill="#047857">14</text>
+  <text x="120" y="122" text-anchor="middle" font-size="10.5" fill="#64748B">test files (C + Python)</text>
+  <rect x="236" y="82" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="336" y="104" text-anchor="middle" font-size="17" font-weight="700" fill="#1D4ED8">5</text>
+  <text x="336" y="122" text-anchor="middle" font-size="10.5" fill="#64748B">benchmark binaries</text>
+  <rect x="452" y="82" width="200" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="552" y="104" text-anchor="middle" font-size="16" font-weight="700" fill="#DC2626">−24.360558</text>
+  <text x="552" y="122" text-anchor="middle" font-size="10.5" fill="#64748B">FullHost bitexact gate</text>
+  <rect x="668" y="82" width="192" height="52" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="764" y="104" text-anchor="middle" font-size="17" font-weight="700" fill="#B45309">~0.4 s</text>
+  <text x="764" y="122" text-anchor="middle" font-size="10.5" fill="#64748B">infer wall (0.8B)</text>
+</svg>

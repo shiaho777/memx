@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440" viewBox="0 0 800 440" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+  <rect x="0" y="0" width="800" height="440" fill="#FFFFFF"/>
+
+  <rect x="24" y="24" width="752" height="64" rx="10" fill="#DBEAFE" stroke="#2563EB"/>
+  <text x="44" y="50" font-size="13" font-weight="700" fill="#1E3A8A">Host — C · Python · Torch</text>
+  <text x="44" y="70" font-size="10.5" fill="#334155">contexts · quotas · tensor descriptors · epoch + WS intents (HOT / PREFETCH / RETIRE) · run_qwen.py</text>
+  <polygon points="392,91 408,91 400,103" fill="#94A3B8"/>
+
+  <rect x="24" y="106" width="752" height="64" rx="10" fill="#D1FAE5" stroke="#059669"/>
+  <text x="44" y="132" font-size="13" font-weight="700" fill="#065F46">Control plane — residency orchestrator</text>
+  <text x="44" y="152" font-size="10.5" fill="#334155">epoch FSM · hot budgets · telemetry · capsule API</text>
+  <polygon points="392,173 408,173 400,185" fill="#94A3B8"/>
+
+  <rect x="24" y="188" width="752" height="64" rx="10" fill="#FEF3C7" stroke="#D97706"/>
+  <text x="44" y="214" font-size="13" font-weight="700" fill="#92400E">Page state machine</text>
+  <text x="44" y="234" font-size="10.5" fill="#334155">RESIDENT → COMPRESSING → COMPRESSED · write_seq · dirty abort · CAS commit</text>
+  <polygon points="392,255 408,255 400,267" fill="#94A3B8"/>
+
+  <rect x="24" y="270" width="752" height="64" rx="10" fill="#EDE9FE" stroke="#7C3AED"/>
+  <text x="44" y="296" font-size="13" font-weight="700" fill="#5B21B6">Vault-native compressed pool</text>
+  <text x="44" y="316" font-size="10.5" fill="#334155">tensor codecs · Metal-assisted compress · sovereign CRW / TCA</text>
+  <polygon points="392,337 408,337 400,349" fill="#94A3B8"/>
+
+  <rect x="24" y="352" width="752" height="64" rx="10" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="44" y="378" font-size="13" font-weight="700" fill="#0F172A">Capability plane — Sovereign Capsule Relay</text>
+  <text x="44" y="398" font-size="10.5" fill="#334155">lite attach · materialize_rank · ultralite vessel</text>
+  <rect x="484" y="366" width="92" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="530" y="381" text-anchor="middle" font-size="10" fill="#5B21B6">spill.bin</text>
+  <rect x="584" y="366" width="92" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="630" y="381" text-anchor="middle" font-size="10" fill="#5B21B6">ledger.bin</text>
+  <rect x="684" y="366" width="92" height="22" rx="6" fill="#EDE9FE" stroke="#C4B5FD"/>
+  <text x="730" y="381" text-anchor="middle" font-size="10" fill="#5B21B6">rank.map</text>
+</svg>
