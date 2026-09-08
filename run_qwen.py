@@ -76,7 +76,7 @@ def _early_memx_env():
         "MEMX_CAPSULE_RELAY": "1",
         "MEMX_CAPSULE_VESSEL": "1",
         "MEMX_CAPSULE_VESSEL_PAGES": "16",
-        "MEMX_CAPSULE_VESSEL_BATCH": "1",
+        "MEMX_CAPSULE_VESSEL_BATCH": "64",
         "MEMX_POOL_SPILL_KEEP": "1",
         "MEMX_CAPSULE_LITE": "1",
         "MEMX_CAPSULE_HOST_BIND": "1",
@@ -736,12 +736,22 @@ class MemXHost:
         end = min(base + self.token_bytes, self.kv.size)
         span = end - base
         if span > 0:
-            chunk = (ctypes.c_uint8 * span)()
-            for j in range(0, span, 2):
-                chunk[j] = ((base + j) // 2 + token_idx) & 0xFF
-                if j + 1 < span:
-                    chunk[j + 1] = pattern
-            ctypes.memmove(ctypes.addressof(buf) + base, chunk, span)
+            tmpl = getattr(self, "_wt_template", None)
+            if tmpl is None or len(tmpl) < span:
+                tmpl = bytearray(max(span, self.token_bytes))
+                tmpl[1::2] = b"\x00" * (len(tmpl) // 2)
+                self._wt_template = tmpl
+            s = (base // 2 + token_idx) & 0xFF
+            half = (span + 1) // 2
+            seq = getattr(self, "_wt_seq", None)
+            if seq is None or len(seq) < 256 + half:
+                seq = bytes(range(256)) * ((256 + half + 255) // 256)
+                self._wt_seq = seq
+            tmpl[0:2 * half:2] = seq[s:s + half]
+            if pattern != getattr(self, "_wt_pattern", None):
+                tmpl[1::2] = bytes([pattern]) * (len(tmpl) // 2)
+                self._wt_pattern = pattern
+            ctypes.memmove(ctypes.addressof(buf) + base, tmpl, span)
         self.written_tokens = max(self.written_tokens, token_idx + 1)
         if (token_idx & 3) == 3:
             self.advance()
@@ -1532,20 +1542,31 @@ class MemXHost:
 
 
     def materialize_enabled(self):
-        return (
-            os.environ.get("MEMX_MATERIALIZE", "1") != "0"
-            and hasattr(self.ctx, "materialize_range")
-            and hasattr(self.ctx, "materialize_tile")
-        )
+        cached = getattr(self, "_mat_enabled", None)
+        if cached is None:
+            cached = (
+                os.environ.get("MEMX_MATERIALIZE", "1") != "0"
+                and hasattr(self.ctx, "materialize_range")
+                and hasattr(self.ctx, "materialize_tile")
+            )
+            self._mat_enabled = cached
+        return cached
 
     def materialize_flags_for(self, weight_dtype, out_dtype):
-        flags = memx.MEMX_MATERIALIZE_KEEP_COMPRESSED | memx.MEMX_MATERIALIZE_ALLOW_RESIDENT
-        if (
-            weight_dtype == torch.bfloat16
-            and out_dtype == torch.float16
-            and os.environ.get("MEMX_MATERIALIZE_FP16", "1") != "0"
-        ):
-            flags |= memx.MEMX_MATERIALIZE_BF16_TO_FP16
+        cache = getattr(self, "_mat_flags_cache", None)
+        if cache is None:
+            cache = self._mat_flags_cache = {}
+        key = (weight_dtype, out_dtype)
+        flags = cache.get(key)
+        if flags is None:
+            flags = memx.MEMX_MATERIALIZE_KEEP_COMPRESSED | memx.MEMX_MATERIALIZE_ALLOW_RESIDENT
+            if (
+                weight_dtype == torch.bfloat16
+                and out_dtype == torch.float16
+                and os.environ.get("MEMX_MATERIALIZE_FP16", "1") != "0"
+            ):
+                flags |= memx.MEMX_MATERIALIZE_BF16_TO_FP16
+            cache[key] = flags
         return flags
 
     def materialize_weight_range(self, name, offset, length, tensor, weight_dtype=None):
@@ -2464,7 +2485,7 @@ try:
             print(f"{tag} capsule_export dir={cap_dir} bytes={capsule_info['bytes']} export_s={capsule_info['export_s']:.3f}")
             if os.environ.get("MEMX_CAPSULE_VESSEL", "1") not in ("0", "false", "False"):
                 vp = int(os.environ.get("MEMX_CAPSULE_VESSEL_PAGES", "16") or "16")
-                vb = int(os.environ.get("MEMX_CAPSULE_VESSEL_BATCH", "1") or "1")
+                vb = int(os.environ.get("MEMX_CAPSULE_VESSEL_BATCH", "64") or "64")
                 vessel = run_capsule_vessel(cap_dir, pages=vp, batch=vb)
                 capsule_info["vessel"] = vessel
                 print(f"{tag} capsule_vessel rss={vessel.get('rss_mb')} phys={vessel.get('phys_mb')} x={vessel.get('x')} logical={vessel.get('page_logical_mb')}MB spill={vessel.get('spill_mb')}MB dense={vessel.get('dense')} mat_ms={vessel.get('mat_ms')} ok={vessel.get('pages_ok')}")
@@ -2562,21 +2583,48 @@ for key in layer_keys:
 _matmul_row_buf = {}
 _matmul_col_buf = {}
 
+# Static env config for the matmul hot path; these knobs are read-only during
+# a run, so parse them once instead of on every strip of every matmul.
+_matmul_cfg = None
+
+
+def _matmul_config():
+    global _matmul_cfg
+    if _matmul_cfg is None:
+        _matmul_cfg = {
+            "block": os.environ.get("MEMX_BLOCK_WS", "1") != "0",
+            "stream": os.environ.get("MEMX_STREAM_WS", "1") != "0",
+            "force_cool": os.environ.get("MEMX_OP_FORCE_COOL", "0") == "1",
+            "tier_seal": os.environ.get("MEMX_TIER_SEAL", "0") == "1",
+            "look": int(os.environ.get("MEMX_BLOCK_PREFETCH", "1")),
+            "chunk": int(os.environ.get("MEMX_MATMUL_CHUNK", "0")),
+            "chunk_mat": int(os.environ.get("MEMX_MATMUL_CHUNK_MAT", "512")),
+            "adaptive": os.environ.get("MEMX_ADAPTIVE_CHUNK", "1") != "0",
+            "hot_frac": float(os.environ.get("MEMX_FP16_HOT_FRAC", "0.25")),
+            "mat_skip_pin": os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0",
+            "col_strip": os.environ.get("MEMX_COL_STRIP", "1") != "0",
+        }
+    return _matmul_cfg
+
+
 def matmul_weight(x, w, host=None, name=None):
     if w is None:
         return None
     x_in = x if x.dtype == torch.float16 else x.half()
-    block = os.environ.get("MEMX_BLOCK_WS", "1") != "0"
-    stream = os.environ.get("MEMX_STREAM_WS", "1") != "0"
-    force_cool = os.environ.get("MEMX_OP_FORCE_COOL", "0") == "1"
-    if (not force_cool) and host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled():
-        if os.environ.get("MEMX_TIER_SEAL", "0") == "1":
+    cfg = _matmul_config()
+    block = cfg["block"]
+    stream = cfg["stream"]
+    force_cool = cfg["force_cool"]
+    mat_on = host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled()
+    if not force_cool and mat_on:
+        if cfg["tier_seal"]:
             force_cool = True
-    look = int(os.environ.get("MEMX_BLOCK_PREFETCH", "1"))
+    use_mat = mat_on and cfg["mat_skip_pin"]
+    look = cfg["look"]
     if w.dtype == torch.float16 and getattr(getattr(w, "device", None), "type", None) != "meta":
         if host is not None and name is not None and block:
             try:
-                host.warm_weight(name, full=False, hot_frac=float(os.environ.get("MEMX_FP16_HOT_FRAC", "0.25")))
+                host.warm_weight(name, full=False, hot_frac=cfg["hot_frac"])
             except Exception:
                 pass
         if w.shape[1] == x_in.shape[-1]:
@@ -2589,10 +2637,10 @@ def matmul_weight(x, w, host=None, name=None):
             except Exception:
                 pass
         return out
-    chunk = int(os.environ.get("MEMX_MATMUL_CHUNK", "0"))
+    chunk = cfg["chunk"]
     if chunk <= 0:
-        if host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled():
-            chunk = int(os.environ.get("MEMX_MATMUL_CHUNK_MAT", "512"))
+        if mat_on:
+            chunk = cfg["chunk_mat"]
         else:
             chunk = 384
     if chunk < 32:
@@ -2601,9 +2649,8 @@ def matmul_weight(x, w, host=None, name=None):
     if w.shape[1] == x_in.shape[-1]:
         rows = w.shape[0]
         row_bytes = w.shape[1] * elem
-        if os.environ.get("MEMX_ADAPTIVE_CHUNK", "1") != "0":
-            use_mat_ad = host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled()
-            if use_mat_ad:
+        if cfg["adaptive"]:
+            if mat_on:
                 if rows >= 2048 and chunk < 768:
                     chunk = 768
                 elif rows <= 1024 and chunk < 512:
@@ -2613,17 +2660,16 @@ def matmul_weight(x, w, host=None, name=None):
                     chunk = 512
                 elif rows <= 1024 and chunk > 256:
                     chunk = 256
-        outs = []
         key = ("row_fp16", int(w.shape[1]))
         buf = _matmul_row_buf.get(key)
         if host is not None and name is not None and block and stream:
             host.stream_begin(name)
+        out = torch.empty((*x_in.shape[:-1], rows), dtype=torch.float16, device=x_in.device)
         for i in range(0, rows, chunk):
             n = min(chunk, rows - i)
             off = i * row_bytes
             ln = n * row_bytes
             if host is not None and name is not None and block:
-                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
                 if stream and not use_mat:
                     pref = 0
                     if look > 0 and i + chunk < rows:
@@ -2646,7 +2692,6 @@ def matmul_weight(x, w, host=None, name=None):
                 else:
                     dst.copy_(w[i:i + n])
             if host is not None and name is not None and block and look > 0:
-                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
                 ni = i + chunk
                 if ni < rows:
                     nn = min(chunk, rows - ni)
@@ -2660,10 +2705,9 @@ def matmul_weight(x, w, host=None, name=None):
                             host.prefetch_weight_range(name, ni * row_bytes, nn * row_bytes)
                         except Exception:
                             pass
-            outs.append(torch.nn.functional.linear(x_in, dst))
+            torch.matmul(x_in, dst.t(), out=out[..., i:i + n])
             if host is not None and name is not None and block and not stream:
                 host.release_weight_range(name, off, ln, force=False)
-        out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
         if host is not None and name is not None:
             try:
                 if block and stream:
@@ -2675,9 +2719,8 @@ def matmul_weight(x, w, host=None, name=None):
         return out
     cols = w.shape[1]
     rows = w.shape[0]
-    if os.environ.get("MEMX_ADAPTIVE_CHUNK", "1") != "0":
-        use_mat_ad = host is not None and hasattr(host, "materialize_enabled") and host.materialize_enabled()
-        if use_mat_ad:
+    if cfg["adaptive"]:
+        if mat_on:
             if cols >= 2048 and chunk < 768:
                 chunk = 768
             elif cols <= 1024 and chunk > 1024:
@@ -2687,17 +2730,14 @@ def matmul_weight(x, w, host=None, name=None):
                 chunk = 512
             elif cols <= 1024 and chunk > 256:
                 chunk = 256
-    outs = []
-    key = "col"
-    buf = _matmul_col_buf.get(key)
-    strip = os.environ.get("MEMX_COL_STRIP", "1") != "0"
+    strip = cfg["col_strip"]
     if host is not None and name is not None and block and stream and not strip:
         host.stream_begin(name)
+    out = torch.empty((*x_in.shape[:-1], cols), dtype=torch.float16, device=x_in.device)
     for i in range(0, cols, chunk):
         n = min(chunk, cols - i)
         if host is not None and name is not None and block:
             if strip:
-                use_mat = host.materialize_enabled() and os.environ.get("MEMX_MATERIALIZE_SKIP_PIN", "1") != "0"
                 if not use_mat:
                     host.pin_weight_col_block(name, rows, cols, i, n, elem, prefetch=True)
                     ni = i + chunk
@@ -2745,7 +2785,7 @@ def matmul_weight(x, w, host=None, name=None):
                 tile.copy_(w[:, i:i + n])
             if host is not None and name is not None and block and strip:
                 host.release_weight_col_block(name, force=False)
-        if host is not None and name is not None and block and strip and look > 0 and host.materialize_enabled():
+        if host is not None and name is not None and block and strip and look > 0 and mat_on:
             ni = i + chunk
             if ni < cols:
                 nn = min(chunk, cols - ni)
@@ -2753,8 +2793,7 @@ def matmul_weight(x, w, host=None, name=None):
                     host.materialize_prefetch_weight_col(name, rows, cols, ni, nn, elem)
                 except Exception:
                     pass
-        outs.append(torch.nn.functional.linear(x_in, tile.t()))
-    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
+        torch.matmul(x_in, tile, out=out[..., i:i + n])
     if host is not None and name is not None:
         try:
             if block and stream and not strip:
@@ -2777,6 +2816,11 @@ def matmul_eligible(w, x_last):
 group_items = list(layer_groups.items())
 op_mode = os.environ.get("MEMX_OP_LEVEL_WS", "1") != "0"
 prefetch_ops = int(os.environ.get("MEMX_OP_PREFETCH", "1"))
+block_ws = os.environ.get("MEMX_BLOCK_WS", "1") != "0"
+block_op_prefetch = os.environ.get("MEMX_BLOCK_OP_PREFETCH", "1") != "0"
+op_prefetch_depth = int(os.environ.get("MEMX_OP_PREFETCH_DEPTH", "1"))
+op_force = os.environ.get("MEMX_OP_FORCE", "1") != "0"
+flush_every = int(os.environ.get("MEMX_OP_FLUSH_EVERY", "0"))
 if host is not None:
     try:
         host.begin_infer_epoch()
@@ -2805,7 +2849,6 @@ with torch.no_grad():
                 break
             scan = idx + 1
             w = state_dict[key]
-            block_ws = os.environ.get("MEMX_BLOCK_WS", "1") != "0"
             if host is not None and not block_ws:
                 host.warm_weight(key, full=True)
                 if prefetch_ops > 0:
@@ -2818,9 +2861,9 @@ with torch.no_grad():
                             break
                         host.warm_weight(pkey, full=False, prefetch_only=True)
                         pref_scan = pidx + 1
-            elif host is not None and block_ws and prefetch_ops > 0 and os.environ.get("MEMX_BLOCK_OP_PREFETCH", "1") != "0":
+            elif host is not None and block_ws and prefetch_ops > 0 and block_op_prefetch:
                 pref_scan = scan
-                npref = min(max(prefetch_ops, 1), int(os.environ.get("MEMX_OP_PREFETCH_DEPTH", "1")))
+                npref = min(max(prefetch_ops, 1), op_prefetch_depth)
                 for _pj in range(npref):
                     pidx, pkey = next_eligible(pref_scan, w.shape[0] if w.shape[1] == x.shape[-1] else w.shape[1])
                     if pkey is None:
@@ -2841,8 +2884,8 @@ with torch.no_grad():
                 host.write_token(token_step % 128)
                 token_step += 1
                 if not block_ws:
-                    host.cool_weight(key, force=os.environ.get("MEMX_OP_FORCE", "1") != "0")
-                if (oi & 7) == 7:
+                    host.cool_weight(key, force=op_force)
+                if flush_every > 0 and ((oi + 1) % flush_every) == 0:
                     try:
                         if hasattr(host.ctx, "seal_flush"):
                             host.ctx.seal_flush()
@@ -2885,7 +2928,7 @@ with torch.no_grad():
                     token_step += 1
                 del out
             if host is not None and candidates:
-                host.cool_weights(candidates, reclaim=True, force=os.environ.get("MEMX_OP_FORCE", "1") != "0")
+                host.cool_weights(candidates, reclaim=True, force=op_force)
         for key in orphan_keys:
             if host is not None:
                 host.warm_weight(key, full=True)
@@ -2905,6 +2948,17 @@ with torch.no_grad():
                 host.cool_weight(key)
             del out
 print(f"{tag} matmul_ops={matmul_n} op_level_ws={int(op_mode)}")
+
+if host is not None and os.environ.get("MEMX_OP_FLUSH_FINAL", "1") != "0":
+    try:
+        if hasattr(host.ctx, "seal_flush"):
+            host.ctx.seal_flush()
+    except Exception:
+        pass
+    try:
+        host.runtime.reclaim()
+    except Exception:
+        pass
 
 if host is not None:
     host.advance()
