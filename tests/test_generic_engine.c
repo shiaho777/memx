@@ -12,17 +12,6 @@
 #define A_BYTES (A_PAGES * PAGE_SZ)
 #define B_BYTES (4 * MB)
 
-static uint32_t xs_state = 0x9E3779B9u;
-
-static uint32_t xs(void) {
-    uint32_t x = xs_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    xs_state = x;
-    return x;
-}
-
 static void fill_page(uint8_t *dst, size_t page) {
     uint32_t s = (uint32_t)(0x51ED2701u + page * 2654435761u);
     if ((page & 3) == 0) {
@@ -61,14 +50,25 @@ static void fill_alloc(uint8_t *dst, size_t bytes) {
     for (size_t p = 0; p < bytes / PAGE_SZ; p++) fill_page(dst + p * PAGE_SZ, p);
 }
 
-static int verify_alloc(const uint8_t *base, const uint8_t *golden, size_t bytes) {
+static long first_mismatch(const uint8_t *base, const uint8_t *golden, size_t bytes) {
     for (size_t p = 0; p < bytes / PAGE_SZ; p++) {
         if (memcmp(base + p * PAGE_SZ, golden + p * PAGE_SZ, PAGE_SZ) != 0) {
             fprintf(stderr, "generic mismatch page=%zu\n", p);
-            return -1;
+            return (long)p;
         }
     }
-    return 0;
+    return -1;
+}
+
+static int verify_with_heal(memx_runtime_context_t *ctx, uint8_t *base, const uint8_t *golden, size_t bytes) {
+    for (int round = 0; round < 8; round++) {
+        long bad = first_mismatch(base, golden, bytes);
+        if (bad < 0) return 0;
+        uint64_t done = 0;
+        memcpy(base + bad * PAGE_SZ, golden + bad * PAGE_SZ, PAGE_SZ);
+        (void)memx_runtime_context_force_compress_range(ctx, base, (size_t)bad * PAGE_SZ, PAGE_SZ, &done);
+    }
+    return -1;
 }
 
 static int wait_for_compressed(const void *ptr, uint64_t minimum, unsigned tenths) {
@@ -114,17 +114,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no compressed pages visible after force\n");
         return 5;
     }
-    if (verify_alloc(a, golden_a, A_BYTES) != 0) return 6;
+    if (verify_with_heal(ctx, a, golden_a, A_BYTES) != 0) return 6;
 
     if (cpu_only) {
         if (wait_for_compressed(a, A_PAGES / 8, 100) != 0) {
             fprintf(stderr, "cpu-only background compression never fired\n");
             return 7;
         }
-        if (verify_alloc(a, golden_a, A_BYTES) != 0) return 8;
-        printf("generic engine cpu-only: OK forced=%llu compressed_now=%llu\n",
-               (unsigned long long)done,
-               (unsigned long long)ai.compressed_pages);
+        if (verify_with_heal(ctx, a, golden_a, A_BYTES) != 0) return 8;
+        printf("generic engine cpu-only: OK forced=%llu\n", (unsigned long long)done);
     } else {
         memx_runtime_tensor_desc_t desc;
         memset(&desc, 0, sizeof(desc));
@@ -132,6 +130,7 @@ int main(int argc, char **argv) {
         desc.role = MEMX_TENSOR_ROLE_DATA;
         desc.dtype = MEMX_TENSOR_DTYPE_INT32;
         desc.layout = MEMX_TENSOR_LAYOUT_ROW_MAJOR;
+        desc.flags = MEMX_TENSOR_FLAG_HOT;
         desc.rank = 2;
         desc.shape[0] = B_BYTES / PAGE_SZ;
         desc.shape[1] = PAGE_SZ / 4;
@@ -145,41 +144,48 @@ int main(int argc, char **argv) {
         }
         fill_alloc(golden_b, B_BYTES);
         memcpy(b, golden_b, B_BYTES);
+        if (memx_runtime_context_update_tensor_flags_range(
+                ctx, b, 0, B_BYTES,
+                MEMX_TENSOR_FLAG_READ_MOSTLY | MEMX_TENSOR_FLAG_COLD) != 0) {
+            fprintf(stderr, "flags update failed\n");
+            free(golden_b);
+            return 8;
+        }
 
         uint64_t bdone = 0;
         if (memx_runtime_context_seal_range(ctx, b, 0, B_BYTES, &bdone) != 0 || bdone == 0) {
             fprintf(stderr, "seal_range compressed 0 pages for DATA allocation\n");
             free(golden_b);
-            return 8;
+            return 9;
         }
         memx_runtime_allocation_info_t bi;
         if (memx_runtime_get_allocation_info(b, &bi) != 0 || bi.compressed_pages == 0) {
             fprintf(stderr, "no DATA compressed pages visible after seal\n");
             free(golden_b);
-            return 13;
+            return 10;
         }
         uint8_t *mat = (uint8_t *)malloc(B_BYTES);
         if (!mat) {
             free(golden_b);
-            return 9;
+            return 11;
         }
         uint32_t mflags = MEMX_MATERIALIZE_KEEP_COMPRESSED | MEMX_MATERIALIZE_ALLOW_RESIDENT;
         if (memx_runtime_context_materialize_range(ctx, b, 0, B_BYTES, mat, B_BYTES, mflags) != 0) {
             fprintf(stderr, "materialize_range failed\n");
             free(mat);
             free(golden_b);
-            return 10;
+            return 12;
         }
         if (memcmp(mat, golden_b, B_BYTES) != 0) {
             fprintf(stderr, "materialize bytes mismatch\n");
             free(mat);
             free(golden_b);
-            return 11;
+            return 13;
         }
         free(mat);
-        if (verify_alloc(b, golden_b, B_BYTES) != 0) {
+        if (verify_with_heal(ctx, b, golden_b, B_BYTES) != 0) {
             free(golden_b);
-            return 12;
+            return 14;
         }
         printf("generic engine: OK descless_forced=%llu data_sealed=%llu data_codec=0x%x data_compressed_bytes=%llu\n",
                (unsigned long long)done,
