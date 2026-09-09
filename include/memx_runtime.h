@@ -315,6 +315,7 @@ typedef struct memx_runtime_capsule_stats {
     uint64_t materialize_batch_pages;
     int dense;
     int export_clone;
+    uint64_t integrity_failures;
 } memx_runtime_capsule_stats_t;
 
 int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes);
@@ -325,6 +326,7 @@ int memx_runtime_capsule_materialize_rank(uint64_t rank, void *dst, size_t dst_c
 int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *dst, size_t dst_stride);
 int memx_runtime_capsule_pidx_at(uint64_t rank, uint32_t *out_pidx);
 int memx_runtime_capsule_stats(memx_runtime_capsule_stats_t *out_stats);
+int memx_runtime_capsule_verify(uint64_t *out_bad, uint64_t *out_pages);
 
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);

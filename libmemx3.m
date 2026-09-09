@@ -9946,7 +9946,9 @@ static int memx_phoenix_seal_locked(MemXZone3 *s, uint64_t *reclaimed) {
 
 
 #define MEMX_CAPSULE_MAGIC 0x4D584350u
-#define MEMX_CAPSULE_VER 2u
+#define MEMX_CAPSULE_VER 3u
+#define MEMX_RANK_MAGIC_V1 0x4D58524Du
+#define MEMX_RANK_MAGIC_V2 0x4D585250u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -9967,6 +9969,18 @@ typedef struct __attribute__((packed)) {
     uint8_t  role;
     uint8_t  flags;
     uint8_t  _pad;
+} memx_capsule_ent_v2_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t pidx;
+    uint32_t csz;
+    uint64_t off;
+    uint32_t seq;
+    uint8_t  codec;
+    uint8_t  role;
+    uint8_t  flags;
+    uint8_t  _pad;
+    uint32_t crc;
 } memx_capsule_ent_t;
 
 typedef struct {
@@ -9974,12 +9988,20 @@ typedef struct {
     uint32_t csz;
     uint32_t pidx;
     uint32_t slot;
+    uint32_t crc;
 } cap_batch_item_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t csz;
     uint32_t off_lo;
     uint32_t off_hi;
+} memx_cap_rank_v1_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t csz;
+    uint32_t off_lo;
+    uint32_t off_hi;
+    uint32_t crc;
 } memx_cap_rank_t;
 
 typedef struct {
@@ -10001,8 +10023,12 @@ typedef struct {
     uint64_t materialize_bytes;
     uint64_t materialize_spans;
     uint64_t materialize_batch_pages;
+    uint64_t integrity_failures;
     memx_capsule_ent_t *ents;
     size_t ents_bytes;
+    uint32_t ent_sz;
+    uint32_t rank_ent_sz;
+    int has_crc;
     uint64_t rank_win_base;
     uint32_t rank_win_count;
     memx_cap_rank_t rank_win[341];
@@ -10050,6 +10076,37 @@ static int capsule_copy_fd(int src_fd, int dst_fd, uint64_t bytes) {
         off += (uint64_t)r;
     }
     return 0;
+}
+
+static void capsule_fsync_mode(int *use_full) {
+    *use_full = 0;
+    const char *e = getenv("MEMX_CAPSULE_FSYNC");
+    if (!e || !e[0] || (e[0] == '1' && !e[1])) return;
+    if (e[0] == '0' && !e[1]) *use_full = -1;
+    else if ((e[0] == 'f' || e[0] == 'F') && strstr(e, "full")) *use_full = 1;
+}
+
+static void capsule_fsync_fd(int fd) {
+    int mode = 0;
+    capsule_fsync_mode(&mode);
+    if (mode < 0 || fd < 0) return;
+#if defined(__APPLE__)
+    if (mode > 0) {
+        (void)fcntl(fd, F_FULLFSYNC);
+        return;
+    }
+#endif
+    (void)fsync(fd);
+}
+
+static void capsule_fsync_dir(const char *dirpath) {
+    int mode = 0;
+    capsule_fsync_mode(&mode);
+    if (mode < 0) return;
+    int dfd = open(dirpath, O_RDONLY);
+    if (dfd < 0) return;
+    capsule_fsync_fd(dfd);
+    close(dfd);
 }
 
 static int capsule_spill_publish(int src_fd, const char *dst_path, uint64_t bytes, int *out_cloned) {
@@ -10109,9 +10166,26 @@ static int capsule_read_ent_at(uint64_t rank, memx_capsule_ent_t *out) {
         return 0;
     }
     if (g_cap.ledger_fd < 0) return -1;
-    off_t off = (off_t)(sizeof(memx_capsule_hdr_t) + rank * sizeof(memx_capsule_ent_t));
-    if (pread(g_cap.ledger_fd, out, sizeof(*out), off) != (ssize_t)sizeof(*out)) return -1;
-    return 0;
+    if (g_cap.ent_sz == sizeof(memx_capsule_ent_t)) {
+        off_t off = (off_t)(sizeof(memx_capsule_hdr_t) + rank * g_cap.ent_sz);
+        if (pread(g_cap.ledger_fd, out, sizeof(*out), off) != (ssize_t)sizeof(*out)) return -1;
+        return 0;
+    }
+    if (g_cap.ent_sz == sizeof(memx_capsule_ent_v2_t)) {
+        memx_capsule_ent_v2_t legacy;
+        off_t off = (off_t)(sizeof(memx_capsule_hdr_t) + rank * g_cap.ent_sz);
+        if (pread(g_cap.ledger_fd, &legacy, sizeof(legacy), off) != (ssize_t)sizeof(legacy)) return -1;
+        memset(out, 0, sizeof(*out));
+        out->pidx = legacy.pidx;
+        out->csz = legacy.csz;
+        out->off = legacy.off;
+        out->seq = legacy.seq;
+        out->codec = legacy.codec;
+        out->role = legacy.role;
+        out->flags = legacy.flags;
+        return 0;
+    }
+    return -1;
 }
 
 static const memx_capsule_ent_t *capsule_find_ent(uint32_t pidx) {
@@ -10253,6 +10327,21 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
     int src_fd = g_z->pool_spill_fd;
     pthread_mutex_unlock(&g_z->alloc_mutex);
 
+    {
+        uint8_t crc_buf[PAGE_SZ];
+        for (uint64_t i = 0; i < n; i++) {
+            if (ents[i].csz == 0 || ents[i].csz > PAGE_SZ) {
+                munmap(ents, ents_bytes);
+                return EIO;
+            }
+            if (pread(src_fd, crc_buf, ents[i].csz, (off_t)ents[i].off) != (ssize_t)ents[i].csz) {
+                munmap(ents, ents_bytes);
+                return EIO;
+            }
+            ents[i].crc = (uint32_t)crc32(0, crc_buf, (uInt)ents[i].csz);
+        }
+    }
+
     if (capsule_mkdir_p(dirpath) != 0) {
         munmap(ents, ents_bytes);
         return EIO;
@@ -10265,6 +10354,13 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
     if (capsule_spill_publish(src_fd, spill_path, spill_bytes, &cloned) != 0) {
         munmap(ents, ents_bytes);
         return EIO;
+    }
+    {
+        int pub_fd = open(spill_path, O_RDWR);
+        if (pub_fd >= 0) {
+            capsule_fsync_fd(pub_fd);
+            close(pub_fd);
+        }
     }
 
     memx_capsule_hdr_t hdr;
@@ -10290,6 +10386,7 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
         munmap(ents, ents_bytes);
         return EIO;
     }
+    capsule_fsync_fd(lfd);
     close(lfd);
     int rank_written = 0;
     uint32_t dense_base = 0;
@@ -10309,7 +10406,7 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
         snprintf(rank_path, sizeof(rank_path), "%s/rank.map", dirpath);
         int rfd = open(rank_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (rfd >= 0) {
-            uint32_t rm_magic = 0x4D58524Du;
+            uint32_t rm_magic = MEMX_RANK_MAGIC_V2;
             uint32_t rm_base = dense_base;
             uint64_t rm_n = n;
             if (pwrite(rfd, &rm_magic, 4, 0) == 4 &&
@@ -10322,16 +10419,19 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
                         ranks[i].csz = ents[i].csz;
                         ranks[i].off_lo = (uint32_t)(ents[i].off & 0xffffffffu);
                         ranks[i].off_hi = (uint32_t)(ents[i].off >> 32);
+                        ranks[i].crc = ents[i].crc;
                     }
                     if (pwrite(rfd, ranks, rbytes, 16) == (ssize_t)rbytes) rank_written = 1;
                     munmap(ranks, rbytes);
                 }
             }
+            capsule_fsync_fd(rfd);
             close(rfd);
             if (!rank_written) unlink(rank_path);
         }
     }
     munmap(ents, ents_bytes);
+    capsule_fsync_dir(dirpath);
     uint64_t total = spill_bytes + sizeof(hdr) + n * sizeof(memx_capsule_ent_t);
     if (rank_written) total += 16ull + n * sizeof(memx_cap_rank_t);
     if (out_bytes) *out_bytes = total;
@@ -10371,27 +10471,55 @@ int memx_runtime_capsule_attach(const char *dirpath) {
         close(lfd);
         return EIO;
     }
-    if (hdr.magic != MEMX_CAPSULE_MAGIC || hdr.version != MEMX_CAPSULE_VER || hdr.ent_count == 0) {
+    if (hdr.magic != MEMX_CAPSULE_MAGIC ||
+        (hdr.version != MEMX_CAPSULE_VER && hdr.version != 2u) ||
+        hdr.ent_count == 0) {
         close(lfd);
         return EINVAL;
     }
     int lite = 0;
     const char *le = getenv("MEMX_CAPSULE_LITE");
     if (le && le[0] == '1') lite = 1;
+    uint32_t ent_sz = (hdr.version >= 3u) ? (uint32_t)sizeof(memx_capsule_ent_t)
+                                          : (uint32_t)sizeof(memx_capsule_ent_v2_t);
+    size_t raw_bytes = (size_t)hdr.ent_count * ent_sz;
     size_t ents_bytes = (size_t)hdr.ent_count * sizeof(memx_capsule_ent_t);
     memx_capsule_ent_t *ents = NULL;
     if (!lite) {
-        void *m = mmap(NULL, ents_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        void *m = mmap(NULL, raw_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) {
             close(lfd);
             return ENOMEM;
         }
-        if (pread(lfd, m, ents_bytes, (off_t)sizeof(hdr)) != (ssize_t)ents_bytes) {
-            munmap(m, ents_bytes);
+        if (pread(lfd, m, raw_bytes, (off_t)sizeof(hdr)) != (ssize_t)raw_bytes) {
+            munmap(m, raw_bytes);
             close(lfd);
             return EIO;
         }
-        ents = (memx_capsule_ent_t *)m;
+        if (ent_sz == sizeof(memx_capsule_ent_t)) {
+            ents = (memx_capsule_ent_t *)m;
+        } else {
+            void *e2 = mmap(NULL, ents_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            if (e2 == MAP_FAILED) {
+                munmap(m, raw_bytes);
+                close(lfd);
+                return ENOMEM;
+            }
+            const memx_capsule_ent_v2_t *legacy = (const memx_capsule_ent_v2_t *)m;
+            memx_capsule_ent_t *wide = (memx_capsule_ent_t *)e2;
+            for (uint64_t i = 0; i < hdr.ent_count; i++) {
+                memset(&wide[i], 0, sizeof(wide[i]));
+                wide[i].pidx = legacy[i].pidx;
+                wide[i].csz = legacy[i].csz;
+                wide[i].off = legacy[i].off;
+                wide[i].seq = legacy[i].seq;
+                wide[i].codec = legacy[i].codec;
+                wide[i].role = legacy[i].role;
+                wide[i].flags = legacy[i].flags;
+            }
+            munmap(m, raw_bytes);
+            ents = wide;
+        }
     } else {
 #if defined(__APPLE__)
         (void)fcntl(lfd, F_NOCACHE, 1);
@@ -10402,6 +10530,13 @@ int memx_runtime_capsule_attach(const char *dirpath) {
         if (ents) munmap(ents, ents_bytes);
         close(lfd);
         return EIO;
+    }
+    struct stat spill_st;
+    if (fstat(sfd, &spill_st) != 0 || (uint64_t)spill_st.st_size < hdr.spill_bytes) {
+        close(sfd);
+        if (ents) munmap(ents, ents_bytes);
+        close(lfd);
+        return EINVAL;
     }
 #if defined(__APPLE__)
     (void)fcntl(sfd, F_NOCACHE, 1);
@@ -10417,15 +10552,19 @@ int memx_runtime_capsule_attach(const char *dirpath) {
     g_cap.rank_win_count = 0;
     g_cap.spill_bytes = hdr.spill_bytes;
     g_cap.ent_count = hdr.ent_count;
+    g_cap.ent_sz = ent_sz;
+    g_cap.rank_ent_sz = 0;
+    g_cap.has_crc = (hdr.version >= 3u);
     g_cap.page_sz = hdr.page_sz ? hdr.page_sz : PAGE_SZ;
     g_cap.page_bytes = hdr.page_bytes;
-    g_cap.ledger_bytes = sizeof(hdr) + ents_bytes;
+    g_cap.ledger_bytes = sizeof(hdr) + raw_bytes;
     g_cap.ents = ents;
     g_cap.ents_bytes = lite ? 0 : ents_bytes;
     g_cap.materialize_pages = 0;
     g_cap.materialize_bytes = 0;
     g_cap.materialize_spans = 0;
     g_cap.materialize_batch_pages = 0;
+    g_cap.integrity_failures = 0;
     g_cap.export_clone = 0;
     snprintf(g_cap.dir, sizeof(g_cap.dir), "%s", dirpath);
     {
@@ -10435,12 +10574,15 @@ int memx_runtime_capsule_attach(const char *dirpath) {
         if (rfd >= 0) {
             uint32_t rm_magic = 0, rm_base = 0;
             uint64_t rm_n = 0;
-            if (pread(rfd, &rm_magic, 4, 0) == 4 && rm_magic == 0x4D58524Du &&
+            if (pread(rfd, &rm_magic, 4, 0) == 4 &&
+                (rm_magic == MEMX_RANK_MAGIC_V2 || rm_magic == MEMX_RANK_MAGIC_V1) &&
                 pread(rfd, &rm_base, 4, 4) == 4 &&
                 pread(rfd, &rm_n, 8, 8) == 8 && rm_n == hdr.ent_count) {
 #if defined(__APPLE__)
                 (void)fcntl(rfd, F_NOCACHE, 1);
 #endif
+                g_cap.rank_ent_sz = (rm_magic == MEMX_RANK_MAGIC_V2) ? (uint32_t)sizeof(memx_cap_rank_t)
+                                                                     : (uint32_t)sizeof(memx_cap_rank_v1_t);
                 g_cap.rank_fd = rfd;
                 g_cap.has_rank = 1;
                 g_cap.dense = 1;
@@ -10484,32 +10626,43 @@ int memx_runtime_capsule_attach(const char *dirpath) {
 }
 
 
-static int capsule_rank_load(uint64_t rank, uint32_t *out_csz, uint64_t *out_off) {
+static int capsule_rank_load(uint64_t rank, uint32_t *out_csz, uint64_t *out_off, uint32_t *out_crc) {
     if (rank >= g_cap.ent_count) return -1;
-    if (g_cap.has_rank && g_cap.rank_fd >= 0) {
+    if (g_cap.has_rank && g_cap.rank_fd >= 0 && g_cap.rank_ent_sz > 0) {
         memx_cap_rank_t r;
-        if (rank >= g_cap.rank_win_base &&
-            rank < g_cap.rank_win_base + (uint64_t)g_cap.rank_win_count) {
-            r = g_cap.rank_win[rank - g_cap.rank_win_base];
-        } else {
-            off_t off = (off_t)(16ull + rank * sizeof(memx_cap_rank_t));
-            uint32_t want = (uint32_t)((g_cap.ent_count - rank) < 341ull ? (g_cap.ent_count - rank) : 341ull);
-            if (pread(g_cap.rank_fd, g_cap.rank_win, (size_t)want * sizeof(memx_cap_rank_t), off)
-                    != (ssize_t)((size_t)want * sizeof(memx_cap_rank_t))) {
-                if (pread(g_cap.rank_fd, &r, sizeof(r), off) != (ssize_t)sizeof(r)) return -1;
-                g_cap.rank_win_base = 0;
-                g_cap.rank_win_count = 0;
+        if (g_cap.rank_ent_sz == sizeof(memx_cap_rank_t)) {
+            if (rank >= g_cap.rank_win_base &&
+                rank < g_cap.rank_win_base + (uint64_t)g_cap.rank_win_count) {
+                r = g_cap.rank_win[rank - g_cap.rank_win_base];
             } else {
-                g_cap.rank_win_base = rank;
-                g_cap.rank_win_count = want;
-                r = g_cap.rank_win[0];
+                off_t off = (off_t)(16ull + rank * g_cap.rank_ent_sz);
+                uint32_t want = (uint32_t)((g_cap.ent_count - rank) < 341ull ? (g_cap.ent_count - rank) : 341ull);
+                if (pread(g_cap.rank_fd, g_cap.rank_win, (size_t)want * g_cap.rank_ent_sz, off)
+                        != (ssize_t)((size_t)want * g_cap.rank_ent_sz)) {
+                    if (pread(g_cap.rank_fd, &r, sizeof(r), off) != (ssize_t)sizeof(r)) return -1;
+                    g_cap.rank_win_base = 0;
+                    g_cap.rank_win_count = 0;
+                } else {
+                    g_cap.rank_win_base = rank;
+                    g_cap.rank_win_count = want;
+                    r = g_cap.rank_win[0];
+                }
             }
+        } else {
+            memx_cap_rank_v1_t rv;
+            off_t off = (off_t)(16ull + rank * g_cap.rank_ent_sz);
+            if (pread(g_cap.rank_fd, &rv, sizeof(rv), off) != (ssize_t)sizeof(rv)) return -1;
+            memset(&r, 0, sizeof(r));
+            r.csz = rv.csz;
+            r.off_lo = rv.off_lo;
+            r.off_hi = rv.off_hi;
         }
         if (r.csz == 0 || r.csz > PAGE_SZ) return -1;
         uint64_t o = ((uint64_t)r.off_hi << 32) | (uint64_t)r.off_lo;
         if (o + (uint64_t)r.csz > g_cap.spill_bytes) return -1;
         if (out_csz) *out_csz = r.csz;
         if (out_off) *out_off = o;
+        if (out_crc) *out_crc = r.crc;
         return 0;
     }
     memx_capsule_ent_t e;
@@ -10518,39 +10671,40 @@ static int capsule_rank_load(uint64_t rank, uint32_t *out_csz, uint64_t *out_off
     if (e.off + (uint64_t)e.csz > g_cap.spill_bytes) return -1;
     if (out_csz) *out_csz = e.csz;
     if (out_off) *out_off = e.off;
+    if (out_crc) *out_crc = e.crc;
     return 0;
 }
 
 static int capsule_rank_load_dense_v(uint64_t base_rank, uint32_t n,
-                                     uint32_t *out_csz, uint64_t *out_off) {
-    if (!out_csz || !out_off) return -1;
+                                     uint32_t *out_csz, uint64_t *out_off, uint32_t *out_crc) {
+    if (!out_csz || !out_off || !out_crc) return -1;
     if (base_rank + (uint64_t)n > g_cap.ent_count) return -1;
-    if (!(g_cap.has_rank && g_cap.rank_fd >= 0 && g_cap.dense)) {
+    if (!(g_cap.has_rank && g_cap.rank_fd >= 0 && g_cap.dense && g_cap.rank_ent_sz > 0)) {
         for (uint32_t k = 0; k < n; k++) {
-            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k], &out_crc[k]) != 0) return -1;
         }
         return 0;
     }
-    uint64_t need = (uint64_t)n * sizeof(memx_cap_rank_t);
-    if (need > (1u << 20)) {
+    uint64_t need = (uint64_t)n * g_cap.rank_ent_sz;
+    if (need > (1u << 20) || g_cap.rank_ent_sz != sizeof(memx_cap_rank_t)) {
         for (uint32_t k = 0; k < n; k++) {
-            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k], &out_crc[k]) != 0) return -1;
         }
         return 0;
     }
     memx_cap_rank_t *rs = (memx_cap_rank_t *)malloc((size_t)need);
     if (!rs) {
         for (uint32_t k = 0; k < n; k++) {
-            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k], &out_crc[k]) != 0) return -1;
         }
         return 0;
     }
-    off_t off = (off_t)(16ull + base_rank * sizeof(memx_cap_rank_t));
+    off_t off = (off_t)(16ull + base_rank * g_cap.rank_ent_sz);
     ssize_t got = pread(g_cap.rank_fd, rs, (size_t)need, off);
     if (got != (ssize_t)need) {
         free(rs);
         for (uint32_t k = 0; k < n; k++) {
-            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k]) != 0) return -1;
+            if (capsule_rank_load(base_rank + k, &out_csz[k], &out_off[k], &out_crc[k]) != 0) return -1;
         }
         return 0;
     }
@@ -10563,9 +10717,15 @@ static int capsule_rank_load_dense_v(uint64_t base_rank, uint32_t n,
         }
         out_csz[k] = csz;
         out_off[k] = o;
+        out_crc[k] = rs[k].crc;
     }
     free(rs);
     return 0;
+}
+
+static int capsule_payload_crc_ok(const uint8_t *payload, uint32_t csz, uint32_t crc) {
+    if (crc == 0) return 1;
+    return ((uint32_t)crc32(0, payload, (uInt)csz) == crc);
 }
 
 int memx_runtime_capsule_materialize_rank(uint64_t rank, void *dst, size_t dst_cap) {
@@ -10573,9 +10733,14 @@ int memx_runtime_capsule_materialize_rank(uint64_t rank, void *dst, size_t dst_c
     if (!g_cap.live || g_cap.spill_fd < 0) return ENOENT;
     uint32_t csz = 0;
     uint64_t off = 0;
-    if (capsule_rank_load(rank, &csz, &off) != 0) return ENOENT;
+    uint32_t crc = 0;
+    if (capsule_rank_load(rank, &csz, &off, &crc) != 0) return ENOENT;
     uint8_t payload[PAGE_SZ];
     if (pread(g_cap.spill_fd, payload, csz, (off_t)off) != (ssize_t)csz) return EIO;
+    if (!capsule_payload_crc_ok(payload, csz, crc)) {
+        g_cap.integrity_failures++;
+        return EBADMSG;
+    }
     cpu_decompress(payload, csz, (uint8_t *)dst);
     g_cap.materialize_pages++;
     g_cap.materialize_bytes += PAGE_SZ;
@@ -10598,6 +10763,10 @@ int memx_runtime_capsule_materialize(uint32_t pidx, void *dst, size_t dst_cap) {
     if (e->off + (uint64_t)e->csz > g_cap.spill_bytes) return EIO;
     uint8_t payload[PAGE_SZ];
     if (pread(g_cap.spill_fd, payload, e->csz, (off_t)e->off) != (ssize_t)e->csz) return EIO;
+    if (!capsule_payload_crc_ok(payload, e->csz, e->crc)) {
+        g_cap.integrity_failures++;
+        return EBADMSG;
+    }
     cpu_decompress(payload, e->csz, (uint8_t *)dst);
     g_cap.materialize_pages++;
     g_cap.materialize_bytes += PAGE_SZ;
@@ -10616,6 +10785,7 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
     int rank_batched = 0;
     uint32_t rb_csz[CAP_BATCH_MAX];
     uint64_t rb_off[CAP_BATCH_MAX];
+    uint32_t rb_crc[CAP_BATCH_MAX];
     uint64_t rmin = 0, rmax = 0;
     if (g_cap.dense) {
         int all_in_range = (n > 0);
@@ -10631,7 +10801,7 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
         if (all_in_range) {
             uint64_t span = rmax - rmin + 1ull;
             if (span <= (1u << 16) &&
-                capsule_rank_load_dense_v(rmin, (uint32_t)span, rb_csz, rb_off) == 0) {
+                capsule_rank_load_dense_v(rmin, (uint32_t)span, rb_csz, rb_off, rb_crc) == 0) {
                 rank_batched = 1;
             }
         }
@@ -10640,6 +10810,7 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
                 uint64_t r = (uint64_t)pidxs[i] - (uint64_t)g_cap.dense_base - rmin;
                 items[m].off = rb_off[r];
                 items[m].csz = rb_csz[r];
+                items[m].crc = rb_crc[r];
                 items[m].pidx = pidxs[i];
                 items[m].slot = i;
                 m++;
@@ -10653,6 +10824,7 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
             if (e->off + (uint64_t)e->csz > g_cap.spill_bytes) continue;
             items[m].off = e->off;
             items[m].csz = e->csz;
+            items[m].crc = e->crc;
             items[m].pidx = e->pidx;
             items[m].slot = i;
             m++;
@@ -10672,6 +10844,10 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
                 if (pread(g_cap.spill_fd, one, items[from].csz, (off_t)items[from].off) != (ssize_t)items[from].csz) return;
                 pl = one;
             }
+            if (!capsule_payload_crc_ok(pl, items[from].csz, items[from].crc)) {
+                g_cap.integrity_failures++;
+                return;
+            }
             cpu_decompress(pl, items[from].csz, (uint8_t *)dst + (size_t)items[from].slot * dst_stride);
             g_cap.materialize_pages++;
             g_cap.materialize_batch_pages++;
@@ -10685,6 +10861,10 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
             if (!pl) {
                 if (pread(g_cap.spill_fd, one, items[k].csz, (off_t)items[k].off) != (ssize_t)items[k].csz) return;
                 pl = one;
+            }
+            if (!capsule_payload_crc_ok(pl, items[k].csz, items[k].crc)) {
+                __sync_fetch_and_add(&g_cap.integrity_failures, 1);
+                return;
             }
             cpu_decompress(pl, items[k].csz, (uint8_t *)dst + (size_t)items[k].slot * dst_stride);
             __sync_fetch_and_add(&g_cap.materialize_pages, 1);
@@ -10768,9 +10948,39 @@ int memx_runtime_capsule_stats(memx_runtime_capsule_stats_t *out_stats) {
     out_stats->materialize_bytes = g_cap.materialize_bytes;
     out_stats->materialize_spans = g_cap.materialize_spans;
     out_stats->materialize_batch_pages = g_cap.materialize_batch_pages;
+    out_stats->integrity_failures = g_cap.integrity_failures;
     out_stats->dense = g_cap.dense;
     out_stats->export_clone = g_cap.export_clone;
     return 0;
+}
+
+int memx_runtime_capsule_verify(uint64_t *out_bad, uint64_t *out_pages) {
+    if (out_bad) *out_bad = 0;
+    if (out_pages) *out_pages = 0;
+    if (!g_cap.live || g_cap.spill_fd < 0) return ENOENT;
+    if (!g_cap.has_crc) {
+        if (out_pages) *out_pages = g_cap.ent_count;
+        return ENOTSUP;
+    }
+    uint64_t bad = 0;
+    uint8_t payload[PAGE_SZ];
+    for (uint64_t rank = 0; rank < g_cap.ent_count; rank++) {
+        uint32_t csz = 0;
+        uint64_t off = 0;
+        uint32_t crc = 0;
+        if (capsule_rank_load(rank, &csz, &off, &crc) != 0) {
+            bad++;
+            continue;
+        }
+        if (pread(g_cap.spill_fd, payload, csz, (off_t)off) != (ssize_t)csz) {
+            bad++;
+            continue;
+        }
+        if (!capsule_payload_crc_ok(payload, csz, crc)) bad++;
+    }
+    if (out_bad) *out_bad = bad;
+    if (out_pages) *out_pages = g_cap.ent_count;
+    return bad ? EBADMSG : 0;
 }
 
 
