@@ -357,6 +357,16 @@ typedef struct {
     volatile uint32_t   res_count;        // number of entries in res_list
     uint32_t            res_cap;          // capacity of res_list
     int                 idle_count;       // adaptive sleep counter for compressor
+    struct {
+        char     name[64];
+        uint32_t first_pidx;
+        uint32_t page_count;
+        uint64_t nbytes;
+        uint16_t role;
+        uint16_t dtype;
+        int      used;
+    } segs[128];
+    uint32_t            seg_count;
 } MemXZone3;
 
 static void note_page_compressed(MemXZone3 *s, size_t page_index, uint8_t codec, uint32_t comp_size);
@@ -7580,6 +7590,46 @@ int memx_runtime_context_seal_range(memx_runtime_context_t *ctx, void *ptr, size
 }
 
 
+int memx_runtime_context_name_segment(memx_runtime_context_t *ctx, void *ptr, const char *name) {
+    if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr || !name || !name[0]) return EINVAL;
+    if (!g_z || !g_z->running || !is_ours(ptr)) return ENOENT;
+    size_t nlen = strlen(name);
+    if (nlen >= 64) return EINVAL;
+    size_t sp = ((uintptr_t)ptr - (uintptr_t)g_z->vmem) / PAGE_SZ;
+    pthread_mutex_lock(&g_z->alloc_mutex);
+    if (sp >= g_z->npages ||
+        g_z->meta[sp].owner_tag != (uintptr_t)ctx ||
+        g_z->meta[sp].alloc_size == 0) {
+        pthread_mutex_unlock(&g_z->alloc_mutex);
+        return EINVAL;
+    }
+    size_t size = g_z->meta[sp].alloc_size;
+    uint32_t npages = (uint32_t)((size + PAGE_SZ - 1) / PAGE_SZ);
+    uint32_t slot = g_z->seg_count;
+    for (uint32_t i = 0; i < g_z->seg_count; i++) {
+        if (strncmp(g_z->segs[i].name, name, sizeof(g_z->segs[i].name)) == 0 ||
+            g_z->segs[i].first_pidx == (uint32_t)sp) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 128) {
+        pthread_mutex_unlock(&g_z->alloc_mutex);
+        return ENOMEM;
+    }
+    memset(&g_z->segs[slot], 0, sizeof(g_z->segs[slot]));
+    memcpy(g_z->segs[slot].name, name, nlen);
+    g_z->segs[slot].first_pidx = (uint32_t)sp;
+    g_z->segs[slot].page_count = npages;
+    g_z->segs[slot].nbytes = size;
+    g_z->segs[slot].role = g_z->meta[sp].tensor_role;
+    g_z->segs[slot].dtype = g_z->meta[sp].tensor_dtype;
+    g_z->segs[slot].used = 1;
+    if (slot == g_z->seg_count) g_z->seg_count++;
+    pthread_mutex_unlock(&g_z->alloc_mutex);
+    return 0;
+}
+
 int memx_runtime_context_seal_range_async(memx_runtime_context_t *ctx, void *ptr, size_t offset, size_t length) {
     if (!ctx || ctx->magic != MEMX_CONTEXT_MAGIC || !ptr) return EINVAL;
     if (!g_z || !g_z->running || !is_ours(ptr)) return ENOENT;
@@ -9949,6 +9999,7 @@ static int memx_phoenix_seal_locked(MemXZone3 *s, uint64_t *reclaimed) {
 #define MEMX_CAPSULE_VER 3u
 #define MEMX_RANK_MAGIC_V1 0x4D58524Du
 #define MEMX_RANK_MAGIC_V2 0x4D585250u
+#define MEMX_SEG_MAGIC 0x4D585347u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -10032,6 +10083,15 @@ typedef struct {
     uint64_t rank_win_base;
     uint32_t rank_win_count;
     memx_cap_rank_t rank_win[341];
+    struct {
+        char name[64];
+        uint32_t first_rank;
+        uint32_t pages;
+        uint64_t nbytes;
+        uint8_t role;
+        uint8_t dtype;
+    } segs[128];
+    uint32_t seg_count;
     char dir[512];
 } memx_capsule_rt_t;
 
@@ -10325,6 +10385,18 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
     uint64_t spill_bytes = g_z->pool_spill_bytes;
     if (spill_bytes < g_z->pool_next) spill_bytes = g_z->pool_next;
     int src_fd = g_z->pool_spill_fd;
+    uint32_t snap_segs = g_z->seg_count;
+    struct {
+        char name[64];
+        uint32_t first_pidx;
+        uint32_t page_count;
+        uint64_t nbytes;
+        uint16_t role;
+        uint16_t dtype;
+        int used;
+    } seg_snap[128];
+    if (snap_segs > 128) snap_segs = 128;
+    if (snap_segs) memcpy(seg_snap, g_z->segs, sizeof(g_z->segs[0]) * snap_segs);
     pthread_mutex_unlock(&g_z->alloc_mutex);
 
     {
@@ -10428,6 +10500,62 @@ int memx_runtime_capsule_export(const char *dirpath, uint64_t *out_bytes) {
             capsule_fsync_fd(rfd);
             close(rfd);
             if (!rank_written) unlink(rank_path);
+        }
+    }
+    uint32_t seg_written = 0;
+    if (snap_segs > 0) {
+        uint64_t seg_first_rank[128];
+        uint32_t seg_pages[128];
+        uint32_t seg_src[128];
+        for (uint32_t si = 0; si < snap_segs; si++) {
+            if (!seg_snap[si].used) continue;
+            uint64_t lo = seg_snap[si].first_pidx;
+            uint64_t hi = lo + seg_snap[si].page_count;
+            uint64_t l = 0, r = n;
+            while (l < r) {
+                uint64_t mid = l + ((r - l) >> 1);
+                if ((uint64_t)ents[mid].pidx < lo) l = mid + 1;
+                else r = mid;
+            }
+            uint64_t pages = 0;
+            while (l + pages < n && (uint64_t)ents[l + pages].pidx < hi) pages++;
+            if (pages == 0) continue;
+            seg_src[seg_written] = si;
+            seg_first_rank[seg_written] = l;
+            seg_pages[seg_written] = (uint32_t)pages;
+            seg_written++;
+        }
+        if (seg_written > 0) {
+            char seg_path[640];
+            snprintf(seg_path, sizeof(seg_path), "%s/manifest.bin", dirpath);
+            int sfd2 = open(seg_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+            if (sfd2 >= 0) {
+                uint32_t smagic = MEMX_SEG_MAGIC;
+                uint32_t sver = 1u;
+                int ok = (pwrite(sfd2, &smagic, 4, 0) == 4 &&
+                          pwrite(sfd2, &sver, 4, 4) == 4 &&
+                          pwrite(sfd2, &seg_written, 4, 8) == 4);
+                for (uint32_t i = 0; ok && i < seg_written; i++) {
+                    uint8_t ent_out[88];
+                    memset(ent_out, 0, sizeof(ent_out));
+                    memcpy(ent_out, seg_snap[seg_src[i]].name, strnlen(seg_snap[seg_src[i]].name, 63));
+                    memcpy(ent_out + 64, &seg_first_rank[i], 4);
+                    memcpy(ent_out + 68, &seg_pages[i], 4);
+                    memcpy(ent_out + 72, &seg_snap[seg_src[i]].nbytes, 8);
+                    ent_out[80] = (uint8_t)(seg_snap[seg_src[i]].role & 0xFF);
+                    ent_out[81] = (uint8_t)(seg_snap[seg_src[i]].dtype & 0xFF);
+                    ok = (pwrite(sfd2, ent_out, sizeof(ent_out), (off_t)(16 + (uint64_t)i * sizeof(ent_out))) == (ssize_t)sizeof(ent_out));
+                }
+                if (ok) {
+                    capsule_fsync_fd(sfd2);
+                } else {
+                    unlink(seg_path);
+                    seg_written = 0;
+                }
+                close(sfd2);
+            } else {
+                seg_written = 0;
+            }
         }
     }
     munmap(ents, ents_bytes);
@@ -10566,6 +10694,7 @@ int memx_runtime_capsule_attach(const char *dirpath) {
     g_cap.materialize_batch_pages = 0;
     g_cap.integrity_failures = 0;
     g_cap.export_clone = 0;
+    g_cap.seg_count = 0;
     snprintf(g_cap.dir, sizeof(g_cap.dir), "%s", dirpath);
     {
         char rank_path[640];
@@ -10594,6 +10723,41 @@ int memx_runtime_capsule_attach(const char *dirpath) {
         }
     }
     if (!lite) capsule_mark_dense();
+    {
+        char seg_path[640];
+        snprintf(seg_path, sizeof(seg_path), "%s/manifest.bin", dirpath);
+        int mfd = open(seg_path, O_RDONLY);
+        if (mfd >= 0) {
+            uint32_t mmagic = 0, mver = 0, mcount = 0;
+            if (pread(mfd, &mmagic, 4, 0) == 4 && mmagic == MEMX_SEG_MAGIC &&
+                pread(mfd, &mver, 4, 4) == 4 && mver == 1u &&
+                pread(mfd, &mcount, 4, 8) == 4 && mcount > 0 && mcount <= 128) {
+                uint8_t ent_in[88];
+                uint32_t loaded = 0;
+                for (uint32_t i = 0; i < mcount; i++) {
+                    if (pread(mfd, ent_in, sizeof(ent_in), (off_t)(16 + (uint64_t)i * sizeof(ent_in))) != (ssize_t)sizeof(ent_in))
+                        break;
+                    uint32_t first_rank, pages;
+                    uint64_t nbytes;
+                    memcpy(&first_rank, ent_in + 64, 4);
+                    memcpy(&pages, ent_in + 68, 4);
+                    memcpy(&nbytes, ent_in + 72, 8);
+                    if (pages == 0 || first_rank + (uint64_t)pages > g_cap.ent_count) break;
+                    memcpy(g_cap.segs[loaded].name, ent_in, 64);
+                    g_cap.segs[loaded].name[63] = 0;
+                    g_cap.segs[loaded].first_rank = first_rank;
+                    g_cap.segs[loaded].pages = pages;
+                    g_cap.segs[loaded].nbytes = nbytes;
+                    g_cap.segs[loaded].role = ent_in[80];
+                    g_cap.segs[loaded].dtype = ent_in[81];
+                    loaded++;
+                }
+                g_cap.seg_count = loaded;
+            }
+            close(mfd);
+        }
+    }
+    if (!lite) capsule_mark_dense();
     else if (!g_cap.has_rank) {
         memx_capsule_ent_t first, last;
         g_cap.dense = 0;
@@ -10614,14 +10778,15 @@ int memx_runtime_capsule_attach(const char *dirpath) {
             }
         }
     }
-    fprintf(stderr, "[memx] capsule_attach dir=%s ents=%llu spill=%lluMB dense=%d base=%u lite=%d rank=%d\n",
+    fprintf(stderr, "[memx] capsule_attach dir=%s ents=%llu spill=%lluMB dense=%d base=%u lite=%d rank=%d segs=%u\n",
             dirpath,
             (unsigned long long)g_cap.ent_count,
             (unsigned long long)(g_cap.spill_bytes / (1024ull * 1024ull)),
             g_cap.dense,
             g_cap.dense_base,
             g_cap.lite,
-            g_cap.has_rank);
+            g_cap.has_rank,
+            g_cap.seg_count);
     return 0;
 }
 
@@ -10981,6 +11146,51 @@ int memx_runtime_capsule_verify(uint64_t *out_bad, uint64_t *out_pages) {
     if (out_bad) *out_bad = bad;
     if (out_pages) *out_pages = g_cap.ent_count;
     return bad ? EBADMSG : 0;
+}
+
+int memx_runtime_capsule_segment(const char *name, uint64_t *out_rank, uint32_t *out_pages, uint64_t *out_nbytes) {
+    if (!name || !name[0]) return EINVAL;
+    if (!g_cap.live) return ENOENT;
+    for (uint32_t i = 0; i < g_cap.seg_count; i++) {
+        if (strncmp(g_cap.segs[i].name, name, sizeof(g_cap.segs[i].name)) == 0) {
+            if (out_rank) *out_rank = g_cap.segs[i].first_rank;
+            if (out_pages) *out_pages = g_cap.segs[i].pages;
+            if (out_nbytes) *out_nbytes = g_cap.segs[i].nbytes;
+            return 0;
+        }
+    }
+    return ENOENT;
+}
+
+int memx_runtime_capsule_materialize_segment(const char *name, void *dst, size_t dst_cap) {
+    if (!name || !name[0] || !dst) return EINVAL;
+    if (!g_cap.live || g_cap.spill_fd < 0) return ENOENT;
+    uint64_t rank = 0;
+    uint32_t pages = 0;
+    uint64_t nbytes = 0;
+    if (memx_runtime_capsule_segment(name, &rank, &pages, &nbytes) != 0) return ENOENT;
+    if (dst_cap < (size_t)pages * (size_t)PAGE_SZ) return EINVAL;
+    uint32_t done = 0;
+    while (done < pages) {
+        uint32_t chunk = pages - done;
+        if (chunk > 512) chunk = 512;
+        uint32_t pidxs[512];
+        for (uint32_t i = 0; i < chunk; i++) {
+            uint64_t r = rank + done + i;
+            if (g_cap.dense) {
+                pidxs[i] = (uint32_t)(g_cap.dense_base + (uint32_t)r);
+            } else {
+                memx_capsule_ent_t e;
+                if (capsule_read_ent_at(r, &e) != 0) return EIO;
+                pidxs[i] = e.pidx;
+            }
+        }
+        int rc = memx_runtime_capsule_materialize_v(pidxs, chunk,
+                    (uint8_t *)dst + (size_t)done * PAGE_SZ, PAGE_SZ);
+        if (rc != 0) return rc;
+        done += chunk;
+    }
+    return 0;
 }
 
 

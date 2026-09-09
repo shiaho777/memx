@@ -327,6 +327,9 @@ int memx_runtime_capsule_materialize_v(const uint32_t *pidxs, uint32_t n, void *
 int memx_runtime_capsule_pidx_at(uint64_t rank, uint32_t *out_pidx);
 int memx_runtime_capsule_stats(memx_runtime_capsule_stats_t *out_stats);
 int memx_runtime_capsule_verify(uint64_t *out_bad, uint64_t *out_pages);
+int memx_runtime_capsule_segment(const char *name, uint64_t *out_rank, uint32_t *out_pages, uint64_t *out_nbytes);
+int memx_runtime_capsule_materialize_segment(const char *name, void *dst, size_t dst_cap);
+int memx_runtime_context_name_segment(memx_runtime_context_t *ctx, void *ptr, const char *name);
 
 int memx_runtime_context_purge(memx_runtime_context_t *ctx, void *ptr);
 int memx_runtime_context_posix_memalign(memx_runtime_context_t *ctx, void **memptr, size_t alignment, size_t size);
