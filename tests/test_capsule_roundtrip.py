@@ -156,10 +156,78 @@ def main():
 
         rt.capsule_detach()
 
+        import errno as _errno
+        import shutil as _shutil
+        import struct as _struct
+        import zlib as _zlib
+
+        tamper_dir = Path(td) / "tampered"
+        _shutil.copytree(td, tamper_dir)
+        ledger = (tamper_dir / "ledger.bin").read_bytes()
+        ent0_off = _struct.unpack_from("<Q", ledger, 72 + 8)[0]
+        ent0_csz = _struct.unpack_from("<I", ledger, 72 + 4)[0]
+        ent0_pidx = _struct.unpack_from("<I", ledger, 72)[0]
+        spill_path = tamper_dir / "spill.bin"
+        raw = bytearray(spill_path.read_bytes())
+        flip_at = ent0_off + ent0_csz // 2
+        raw[flip_at] ^= 0xFF
+        spill_path.write_bytes(bytes(raw))
+        rt.capsule_attach(str(tamper_dir))
+        buf = bytearray(16384)
+        got_ebadmsg = False
+        try:
+            rt.capsule_materialize(ent0_pidx, buf)
+        except OSError as e:
+            got_ebadmsg = (e.errno == _errno.EBADMSG)
+        assert got_ebadmsg, f"tampered page did not fail with EBADMSG (pidx={ent0_pidx})"
+        bad, total, vrc = rt.capsule_verify()
+        assert bad >= 1 and total == stats.ent_count, f"verify counts wrong: bad={bad} total={total}"
+        assert vrc == _errno.EBADMSG, f"verify rc={vrc}"
+        st = rt.capsule_stats()
+        assert st.integrity_failures >= 1, "integrity_failures not counted"
+        rt.capsule_detach()
+
+        trunc_dir = Path(td) / "truncated"
+        _shutil.copytree(td, trunc_dir)
+        tspill = trunc_dir / "spill.bin"
+        with open(tspill, "r+b") as f:
+            f.truncate(max(1, os.path.getsize(tspill) // 2))
+        got_einval = False
+        try:
+            rt.capsule_attach(str(trunc_dir))
+        except OSError as e:
+            got_einval = (e.errno == _errno.EINVAL)
+        assert got_einval, "truncated spill did not fail attach with EINVAL"
+        rt.capsule_detach()
+
+        v2_dir = Path(td) / "v2capsule"
+        v2_dir.mkdir()
+        v2_page = bytes((i * 7 + 3) & 0xFF for i in range(16384))
+        v2_comp = _zlib.compress(v2_page, 1)
+        v2_payload = b"MX\x85\x01" + _struct.pack("<I", len(v2_comp)) + v2_comp
+        (v2_dir / "spill.bin").write_bytes(v2_payload)
+        v2_hdr = _struct.pack(
+            "<IIQQQQ4Q", 0x4D584350, 2, 1, len(v2_payload), 16384, 16384, 0, 0, 0, 0
+        )
+        v2_ent = _struct.pack("<IQIBBBB", 1000, 0, 0, 0, 0x85, 1, 0)[:24]
+        v2_ent = _struct.pack("<IIQIBBBB", 1000, len(v2_payload), 0, 0, 0x85, 1, 0, 0)
+        (v2_dir / "ledger.bin").write_bytes(v2_hdr + v2_ent)
+        rt.capsule_attach(str(v2_dir))
+        v2_buf = bytearray(16384)
+        rt.capsule_materialize(1000, v2_buf)
+        assert bytes(v2_buf) == v2_page, "v2 legacy capsule materialize not bitexact"
+        got_enotsup = False
+        try:
+            rt.capsule_verify()
+        except OSError as e:
+            got_enotsup = (e.errno in (_errno.ENOTSUP, _errno.EOPNOTSUPP))
+        assert got_enotsup, "v2 capsule verify did not report ENOTSUP"
+        rt.capsule_detach()
+
     a.free()
     ctx.destroy()
     rt.shutdown()
-    print(f"OK capsule roundtrip capsule_pages={len(in_cap)}/{pages} materialize_v batch==single ws_tile+apply_ws")
+    print(f"OK capsule roundtrip capsule_pages={len(in_cap)}/{pages} materialize_v batch==single ws_tile+apply_ws crc-tamper+truncate+v2-legacy")
     return 0
 
 

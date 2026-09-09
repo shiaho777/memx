@@ -1,4 +1,5 @@
 import ctypes
+import errno
 import threading
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class CapsuleStats(ctypes.Structure):
         ("materialize_batch_pages", ctypes.c_uint64),
         ("dense", ctypes.c_int),
         ("export_clone", ctypes.c_int),
+        ("integrity_failures", ctypes.c_uint64),
     ]
 
 
@@ -738,6 +740,16 @@ class Runtime:
         if rc != 0:
             raise OSError(rc, "memx_runtime_capsule_stats failed")
         return out
+
+    def capsule_verify(self):
+        if not hasattr(self.lib, "memx_runtime_capsule_verify"):
+            raise OSError("capsule_verify unavailable")
+        bad = ctypes.c_uint64(0)
+        pages = ctypes.c_uint64(0)
+        rc = self.lib.memx_runtime_capsule_verify(ctypes.byref(bad), ctypes.byref(pages))
+        if rc != 0 and rc != errno.EBADMSG:
+            raise OSError(rc, "memx_runtime_capsule_verify failed")
+        return int(bad.value), int(pages.value), rc
 
 
 class Context:
