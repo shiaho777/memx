@@ -751,6 +751,32 @@ class Runtime:
             raise OSError(rc, "memx_runtime_capsule_verify failed")
         return int(bad.value), int(pages.value), rc
 
+    def capsule_segment(self, name):
+        if not hasattr(self.lib, "memx_runtime_capsule_segment"):
+            raise OSError("capsule_segment unavailable")
+        rank = ctypes.c_uint64(0)
+        pages = ctypes.c_uint32(0)
+        nbytes = ctypes.c_uint64(0)
+        rc = self.lib.memx_runtime_capsule_segment(
+            name.encode("utf-8"), ctypes.byref(rank), ctypes.byref(pages), ctypes.byref(nbytes)
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_segment failed")
+        return int(rank.value), int(pages.value), int(nbytes.value)
+
+    def capsule_materialize_segment(self, name, buf):
+        if not hasattr(self.lib, "memx_runtime_capsule_materialize_segment"):
+            raise OSError("capsule_materialize_segment unavailable")
+        if not isinstance(buf, (bytearray, memoryview)):
+            raise TypeError("buf must be bytearray/memoryview")
+        addr = self._buf_addr(buf)
+        rc = self.lib.memx_runtime_capsule_materialize_segment(
+            name.encode("utf-8"), ctypes.c_void_p(addr), ctypes.c_size_t(len(buf))
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_capsule_materialize_segment failed")
+        return True
+
 
 class Context:
     def __init__(self, runtime, handle):
@@ -780,6 +806,16 @@ class Context:
         if not ptr:
             raise MemoryError("memx_runtime_context_malloc failed")
         return Allocation(self, ctypes.c_void_p(ptr), size, name)
+
+    def name_segment(self, allocation, name):
+        if not hasattr(self.runtime.lib, "memx_runtime_context_name_segment"):
+            raise OSError("name_segment unavailable")
+        rc = self.runtime.lib.memx_runtime_context_name_segment(
+            self.handle, allocation.ptr, name.encode("utf-8")
+        )
+        if rc != 0:
+            raise OSError(rc, "memx_runtime_context_name_segment failed")
+        return True
 
     def update_kv_cache_window(self, allocation, window):
         rc = self.runtime.lib.memx_runtime_context_update_kv_cache_window(self.handle, allocation.ptr, ctypes.byref(window))

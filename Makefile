@@ -16,7 +16,7 @@ GENERIC_TEST = $(BUILD_DIR)/test_generic_engine
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 
-.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -96,6 +96,9 @@ test-materialize: $(RUNTIME_DYLIB)
 
 test-capsule-roundtrip: $(RUNTIME_DYLIB)
 	@python3 tests/test_capsule_roundtrip.py
+
+test-capsule-segments: $(RUNTIME_DYLIB)
+	@python3 tests/test_capsule_segments.py
 
 test-python-transformer: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_transformer_lifecycle.py

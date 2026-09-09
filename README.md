@@ -217,6 +217,28 @@ MemX is not LLM-only. Any large managed allocation can use the compressed reside
 
 Known limitation: incompressible generic pages (e.g. random bytes) are stored raw and retried by the background compressor each pass — see the res_list churn issue for the tracking of the retry/pollution behavior.
 
+### Device persistence (snapshot store)
+
+Capsules double as an on-device persistence plane for arbitrary managed memory, with named segments:
+
+```c
+memx_runtime_context_name_segment(ctx, rows_ptr, "rows");
+memx_runtime_capsule_export("/data/store/gen-0042/", &bytes);
+
+/* any process, no runtime init needed */
+memx_runtime_capsule_attach("/data/store/gen-0042/");
+memx_runtime_capsule_segment("rows", &rank, &pages, &nbytes);
+memx_runtime_capsule_materialize_segment("rows", dst, dst_cap);
+memx_runtime_capsule_verify(&bad, &pages);
+```
+
+- **Format v3** (since the integrity upgrade): every page carries a CRC32 of its compressed payload; `materialize` returns `EBADMSG` on mismatch instead of silently decoding garbage. v2 capsules from older binaries remain readable (CRC skipped, `capsule_verify` reports `ENOTSUP`).
+- **Durability**: export publishes spill → ledger → rank.map → manifest with per-file fsync + directory fsync (`MEMX_CAPSULE_FSYNC=0` disables, `=full` uses `F_FULLFSYNC`). Attach rejects a truncated spill (`EINVAL`).
+- **Semantics**: immutable snapshot. Update = export a new generation directory (APFS clonefile keeps unchanged pages near-zero cost); concurrent access = many readers, one writer by convention. Pages that were resident (incompressible / hot) at export time are simply absent — `capsule_segment` reports actual coverage.
+- **Non-goals**: no in-place write-back, no multi-writer locking, not a transactional store.
+
+`make test-capsule-segments` gates the path end-to-end (two named segments + one unnamed allocation, bitexact by-name materialize, clean verify).
+
 ### Non-destructive materialize and archives
 
 Fault/decompress can **consume** compressed pool data into HOT residency. For read-mostly weight strips that is often wrong.
