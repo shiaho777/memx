@@ -313,6 +313,7 @@ typedef struct {
     pthread_t           async_pf_threads[ASYNC_PF_WORKERS];
     int                 async_pf_nworkers;
     volatile int        async_pf_running;
+    int                 async_pf_disabled;
     volatile uint64_t   async_pf_enqueued;
     volatile uint64_t   async_pf_completed;
     #define ASYNC_SEAL_Q_SIZE 512
@@ -3998,6 +3999,18 @@ static uint64_t pool_reclaim_pending_locked(MemXZone3 *s) {
 
 
 static __thread uint8_t g_decomp_scratch[PAGE_SZ];
+
+#define PF_DEC_SLOTS 128
+typedef struct {
+    volatile uint64_t tag;
+    uint32_t pidx;
+    uint32_t csz;
+    uint64_t off;
+    uint32_t wseq;
+    uint8_t data[PAGE_SZ];
+} pf_dec_t;
+static pf_dec_t *g_pf_dec = NULL;
+static int pool_copy_blob_locked(MemXZone3 *s, uint64_t d_off, uint32_t d_sz, uint8_t *payload);
 static __thread uint8_t g_codec_scratch[PAGE_SZ];
 static __thread uint8_t g_comp_payload[PAGE_SZ];
 
@@ -4014,6 +4027,8 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
         if (st != PAGE_COMPRESSED) return 0;
         uint64_t d_off = 0;
         uint32_t d_sz = 0;
+        uint32_t dec_wseq = 0;
+        pf_dec_t *dec_hit = NULL;
         int spill_direct = 0;
         int served = 0;
         pthread_mutex_lock(&s->alloc_mutex);
@@ -4032,9 +4047,28 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
         __sync_fetch_and_add(&s->live_resident_pages, 1);
         d_off = m->pool_offset;
         d_sz = m->comp_size;
+        dec_wseq = m->write_seq;
+        if (d_sz > 0 && d_sz <= PAGE_SZ && g_pf_dec) {
+            pf_dec_t *e = &g_pf_dec[page_index & (PF_DEC_SLOTS - 1)];
+            if (e->tag == 2 && e->pidx == (uint32_t)page_index &&
+                e->off == d_off && e->csz == d_sz && e->wseq == dec_wseq) {
+                if (__sync_bool_compare_and_swap(&e->tag, 2, 1)) {
+                    if (e->pidx == (uint32_t)page_index && e->off == d_off &&
+                        e->csz == d_sz && e->wseq == dec_wseq) {
+                        dec_hit = e;
+                    } else {
+                        __sync_synchronize();
+                        e->tag = 2;
+                    }
+                }
+            }
+        }
         if (d_sz > 0 && d_sz <= PAGE_SZ) {
             int have_spill = (s->pool_spill_fd > 2 && s->pool_spill_bytes >= d_off + (uint64_t)d_sz);
-            if (have_spill && (pool_is_vault_native(s) || s->pool_detached)) {
+            if (dec_hit) {
+                dedup_decref(s, d_off, d_sz);
+                served = 1;
+            } else if (have_spill && (pool_is_vault_native(s) || s->pool_detached)) {
                 if (pool_is_vault_native(s)) {
                     if (pool_vault_cache_get_locked(s, d_off, d_sz, g_comp_payload)) {
                         served = 1;
@@ -4070,6 +4104,10 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
                 spill_direct = 1;
             }
             if (!served && !spill_direct) {
+                if (dec_hit) {
+                    __sync_synchronize();
+                    dec_hit->tag = 2;
+                }
                 m->state = PAGE_COMPRESSED;
                 __sync_fetch_and_add(&s->live_compressed_pages, 1);
                 if (s->live_resident_pages) __sync_fetch_and_sub(&s->live_resident_pages, 1);
@@ -4098,7 +4136,10 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
 
         uint8_t *pa = (uint8_t *)s->vmem + page_index * PAGE_SZ;
         uint8_t *tmp = g_decomp_scratch;
-        if (d_sz == 0 || d_sz > PAGE_SZ) {
+        if (dec_hit) {
+            tmp = dec_hit->data;
+            __sync_fetch_and_add(&s->prefetch_hits, 1);
+        } else if (d_sz == 0 || d_sz > PAGE_SZ) {
             memset(tmp, 0, PAGE_SZ);
         } else {
             cpu_decompress(g_comp_payload, d_sz, tmp);
@@ -4108,6 +4149,10 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
         madvise(pa, PAGE_SZ, MADV_FREE_REUSE);
 #endif
         memcpy(pa, tmp, PAGE_SZ);
+        if (dec_hit) {
+            __sync_synchronize();
+            dec_hit->tag = 2;
+        }
         m->prefetched = prefetched;
         m->cooldown = cooldown;
         m->pool_offset = 0;
@@ -4122,7 +4167,41 @@ static int decompress_compressed_page(MemXZone3 *s, size_t page_index, uint8_t p
     return 0;
 }
 
-static int prefetch_page(MemXZone3 *s, size_t page_index, uint8_t cooldown) {
+static int pf_predecode(MemXZone3 *s, size_t page_index) {
+    if (!s || !g_pf_dec || page_index >= s->npages) return 0;
+    PageMeta *m = &s->meta[page_index];
+    if (m->state != PAGE_COMPRESSED || m->comp_size == 0 || m->comp_size > PAGE_SZ) return 0;
+    uint8_t payload[PAGE_SZ];
+    pthread_mutex_lock(&s->alloc_mutex);
+    if (m->state != PAGE_COMPRESSED || m->comp_size == 0 || m->comp_size > PAGE_SZ) {
+        pthread_mutex_unlock(&s->alloc_mutex);
+        return 0;
+    }
+    uint64_t off = m->pool_offset;
+    uint32_t csz = m->comp_size;
+    uint32_t wseq = m->write_seq;
+    int ok = (pool_copy_blob_locked(s, off, csz, payload) == 0);
+    pthread_mutex_unlock(&s->alloc_mutex);
+    if (!ok) return 0;
+    uint8_t decoded[PAGE_SZ];
+    cpu_decompress(payload, csz, decoded);
+    pf_dec_t *e = &g_pf_dec[page_index & (PF_DEC_SLOTS - 1)];
+    uint64_t t = e->tag;
+    if (t == 0 || t == 2) {
+        if (__sync_bool_compare_and_swap(&e->tag, t, 1)) {
+            e->pidx = (uint32_t)page_index;
+            e->off = off;
+            e->csz = csz;
+            e->wseq = wseq;
+            memcpy(e->data, decoded, PAGE_SZ);
+            __sync_synchronize();
+            e->tag = 2;
+        }
+    }
+    return 1;
+}
+
+static int prefetch_page_install(MemXZone3 *s, size_t page_index, uint8_t cooldown) {
     if (!s || page_index >= s->npages) return 0;
     if (decompress_compressed_page(s, page_index, 1, cooldown)) return 1;
     PageMeta *m = &s->meta[page_index];
@@ -4140,7 +4219,27 @@ static int prefetch_page(MemXZone3 *s, size_t page_index, uint8_t cooldown) {
     return 0;
 }
 
-static int async_pf_enqueue_n(MemXZone3 *s, const uint32_t *pages, uint8_t *cooldowns, int n, int wake) {
+static int prefetch_page(MemXZone3 *s, size_t page_index, uint8_t cooldown) {
+    if (!s || page_index >= s->npages) return 0;
+    PageMeta *m = &s->meta[page_index];
+    if (m->state == PAGE_COMPRESSED) {
+        return pf_predecode(s, page_index);
+    }
+    uint8_t old = __sync_val_compare_and_swap(&m->state, PAGE_RESIDENT, PAGE_HOT);
+    if (old == PAGE_RESIDENT) {
+        m->prefetched = 1;
+        m->cooldown = cooldown;
+        hot_list_add(s, (uint32_t)page_index);
+        return 1;
+    }
+    if (old == PAGE_HOT && m->cooldown < cooldown) {
+        m->prefetched = 1;
+        m->cooldown = cooldown;
+    }
+    return 0;
+}
+
+static int async_pf_enqueue_n(MemXZone3 *s, const uint32_t *pages, uint8_t *cooldowns, int n, int wake, int install) {
     if (!s || !s->async_pf_q || !s->async_pf_running || !pages || n <= 0) return 0;
     int enq = 0;
     for (int i = 0; i < n; i++) {
@@ -4148,7 +4247,9 @@ static int async_pf_enqueue_n(MemXZone3 *s, const uint32_t *pages, uint8_t *cool
         if (page_index >= s->npages) continue;
         if (s->meta[page_index].state != PAGE_COMPRESSED) continue;
         uint8_t cooldown = cooldowns ? cooldowns[i] : 5;
-        uint32_t packed = 0x80000000u | ((uint32_t)cooldown << 23) | (page_index & 0x007FFFFFu);
+        if (cooldown > 127) cooldown = 127;
+        uint32_t packed = 0x80000000u | ((uint32_t)(install ? 1 : 0) << 30) |
+                          ((uint32_t)cooldown << 23) | (page_index & 0x007FFFFFu);
         int ok = 0;
         for (int spin = 0; spin < 16; spin++) {
             uint32_t head = s->async_pf_head;
@@ -4176,7 +4277,7 @@ static int async_pf_enqueue_n(MemXZone3 *s, const uint32_t *pages, uint8_t *cool
 
 static int async_pf_enqueue(MemXZone3 *s, uint32_t page_index, uint8_t cooldown) {
     uint8_t cd = cooldown;
-    return async_pf_enqueue_n(s, &page_index, &cd, 1, 1);
+    return async_pf_enqueue_n(s, &page_index, &cd, 1, 1, 0);
 }
 
 static int force_compress_page_now(MemXZone3 *s, size_t pidx);
@@ -4295,6 +4396,7 @@ static void *async_seal_worker(void *arg) {
 static void *async_pf_worker(void *arg) {
     MemXZone3 *s = (MemXZone3 *)arg;
     in_memx = 1;
+    if (s->async_pf_disabled) return NULL;
     while (s->async_pf_running || s->async_pf_tail != s->async_pf_head) {
         int drained = 0;
         for (int item = 0; item < 48; item++) {
@@ -4319,8 +4421,14 @@ static void *async_pf_worker(void *arg) {
             }
             if (!got) break;
             uint32_t page = packed & 0x007FFFFFu;
-            uint8_t cooldown = (uint8_t)((packed >> 23) & 0xFF);
-            if (page < s->npages && prefetch_page(s, page, cooldown)) {
+            uint8_t cooldown = (uint8_t)((packed >> 23) & 0x7F);
+            int install_auth = (packed >> 30) & 1u;
+            int did = 0;
+            if (page < s->npages) {
+                did = install_auth ? prefetch_page_install(s, page, cooldown)
+                                   : prefetch_page(s, page, cooldown);
+            }
+            if (did) {
                 __sync_fetch_and_add(&s->async_pf_completed, 1);
             }
             drained++;
@@ -4552,7 +4660,7 @@ static void fault_handler(int sig, siginfo_t *info, void *ctx) {
                     async_n++;
                 }
             }
-            if (async_n > 0) pf += async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1);
+            if (async_n > 0) pf += async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1, 0);
             if (pf > 0) __sync_fetch_and_add(&g_z->prefetch_count, 1);
         }
     }
@@ -5960,6 +6068,15 @@ static void init_memx(void) {
     pthread_mutex_init(&g_z->async_pf_mutex, NULL);
     pthread_cond_init(&g_z->async_pf_cond, NULL);
     g_z->async_pf_running = 1;
+    {
+        const char *nap = getenv("MEMX_NO_ASYNC_PF");
+        g_z->async_pf_disabled = (nap && nap[0] == '1') ? 1 : 0;
+        if (!g_z->async_pf_disabled) {
+            g_pf_dec = (pf_dec_t *)mmap(NULL, (size_t)PF_DEC_SLOTS * sizeof(pf_dec_t),
+                                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (g_pf_dec == MAP_FAILED) g_pf_dec = NULL;
+        }
+    }
     g_z->async_pf_nworkers = 0;
     g_z->encode_nworkers = 0;
     g_z->encode_pool_running = 0;
@@ -6102,6 +6219,10 @@ static void fini_memx(void) {
     if (g_z->vault_cache && g_z->vault_cache != MAP_FAILED && g_z->vault_cache_bytes) munmap(g_z->vault_cache, (size_t)g_z->vault_cache_bytes);
     if (g_z->pool_spill_fd > 2) { close(g_z->pool_spill_fd); g_z->pool_spill_fd = -1; }
     shared_stats_cleanup();
+    if (g_pf_dec) {
+        munmap(g_pf_dec, (size_t)PF_DEC_SLOTS * sizeof(pf_dec_t));
+        g_pf_dec = NULL;
+    }
     MemXZone3 *old_z = g_z;
     g_z = NULL;  // Prevent concurrent access before munmap
     fprintf(stderr, "[memx] ✅ Shutdown. Compressed %llu pages, saved %llu MB, resolved %llu faults, dedup %llu hits, prefetch %llu (hits %llu)\n",
@@ -6508,7 +6629,7 @@ static int prefetch_range_internal(const void *ptr, size_t offset, size_t length
     for (size_t i = first_page; i <= last_page; i++, idx++) {
         int ok = 0;
         if (idx < sync_budget) {
-            ok = prefetch_page(g_z, i, cd);
+            ok = prefetch_page_install(g_z, i, cd);
             if (ok) prefetched++;
         } else if (async_seen < async_budget) {
             if (g_z->meta[i].state == PAGE_COMPRESSED) {
@@ -6517,7 +6638,7 @@ static int prefetch_range_internal(const void *ptr, size_t offset, size_t length
                 async_n++;
                 async_seen++;
                 if (async_n >= 192) {
-                    int enq = async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1);
+                    int enq = async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1, 1);
                     if (enq > 0) prefetched += (uint64_t)enq;
                     async_n = 0;
                 }
@@ -6525,7 +6646,7 @@ static int prefetch_range_internal(const void *ptr, size_t offset, size_t length
         }
     }
     if (async_n > 0) {
-        int enq = async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1);
+        int enq = async_pf_enqueue_n(g_z, async_pages, async_cds, async_n, 1, 1);
         if (enq > 0) prefetched += (uint64_t)enq;
     }
     if (prefetched > 0) __sync_fetch_and_add(&g_z->prefetch_count, 1);
@@ -11289,11 +11410,11 @@ int memx_runtime_context_update_tensor_flags_range(memx_runtime_context_t *ctx, 
     size_t overflow_last = last_page;
     pthread_mutex_unlock(&g_z->alloc_mutex);
     for (size_t i = 0; i < promote_count; i++) {
-        prefetch_page(g_z, promote_pages[i], 100);
+        prefetch_page_install(g_z, promote_pages[i], 100);
     }
     if (promote_overflow) {
         for (size_t i = overflow_first; i <= overflow_last; i++) {
-            if (g_z->meta[i].state == PAGE_COMPRESSED) prefetch_page(g_z, i, 100);
+            if (g_z->meta[i].state == PAGE_COMPRESSED) prefetch_page_install(g_z, i, 100);
         }
     }
     context_adjust_tensor_flag_bytes((uintptr_t)ctx, hot_sub, hot_add, no_comp_sub, no_comp_add);
