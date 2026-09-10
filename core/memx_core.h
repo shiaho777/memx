@@ -69,6 +69,8 @@ typedef struct {
     uint64_t pool_offset;
     uint8_t  prefetched;
     uint8_t  cooldown;
+    uint8_t  in_res_list;
+    uint8_t  in_hot_list;
     uint16_t tensor_role;
     uint16_t tensor_dtype;
     uint16_t tensor_layout;

@@ -51,6 +51,8 @@ typedef struct memx_runtime_stats {
     uint64_t tensor_delta_split_bytes_saved;
     uint64_t tensor_exp_pack_pages;
     uint64_t tensor_exp_pack_bytes_saved;
+    uint64_t res_list_entries;
+    uint64_t hot_list_entries;
 } memx_runtime_stats_t;
 
 typedef struct memx_runtime_context memx_runtime_context_t;

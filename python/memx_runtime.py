@@ -127,6 +127,8 @@ class Stats(ctypes.Structure):
         ("tensor_delta_split_bytes_saved", ctypes.c_uint64),
         ("tensor_exp_pack_pages", ctypes.c_uint64),
         ("tensor_exp_pack_bytes_saved", ctypes.c_uint64),
+        ("res_list_entries", ctypes.c_uint64),
+        ("hot_list_entries", ctypes.c_uint64),
     ]
 
 
