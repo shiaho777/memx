@@ -39,3 +39,25 @@ jobs:
             echo "- Merge gate only; does not close GitHub Issues."
             echo "- Issues close via PR body Fixes #N / Closes #N on merge."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  linux:
+    name: linux-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Core gates + POSIX adapter (4K hardware pages)
+        run: |
+          make CC=clang core-test core-sim core-audit posix-adapter
+
+      - name: Linux summary
+        if: always()
+        run: |
+          {
+            echo "## MemX Linux core"
+            echo ""
+            echo "- Cross-OS verification: freestanding core gates, reference"
+            echo "- embedder at 4K + 16K logical pages, and the POSIX runtime"
+            echo "- adapter on real 4K hardware pages (this machine)."
+          } >> "$GITHUB_STEP_SUMMARY"
