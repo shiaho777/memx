@@ -17,7 +17,7 @@ GENERIC_TEST = $(BUILD_DIR)/test_generic_engine
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 
-.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime core-test core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -27,6 +27,27 @@ $(BUILD_DIR):
 $(CORE_LIB): core/memx_core.c core/memx_core.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -c -o $(BUILD_DIR)/memx_core.o core/memx_core.c
 	ar rcs $@ $(BUILD_DIR)/memx_core.o
+
+CORE_TEST = $(BUILD_DIR)/test_core_kernel
+CLANG_RESOURCE = $(shell $(CC) -print-resource-dir)
+
+$(CORE_TEST): tests/test_core_kernel.c $(CORE_LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Icore -o $@ $< $(CORE_LIB) -lz
+
+core-test: $(CORE_TEST)
+	@$(CORE_TEST)
+
+core-audit:
+	@$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem core/shims -isystem $(CLANG_RESOURCE)/include -c -o $(BUILD_DIR)/memx_core_fs.o core/memx_core.c
+	@nm -u $(BUILD_DIR)/memx_core_fs.o | awk '{ print $$NF }' | sed 's/^_//' > $(BUILD_DIR)/core_undef.txt
+	@bad=0; while read sym; do \
+		case $$sym in \
+			memcpy|memset|memcmp|memmove) ;; \
+			*) echo "UNEXPECTED UNDEFINED SYMBOL: $$sym"; bad=1 ;; \
+		esac; \
+	done < $(BUILD_DIR)/core_undef.txt; \
+	if [ $$bad -ne 0 ]; then exit 1; fi; \
+	echo "core audit: OK (undefined symbols: $$(tr '\n' ' ' < $(BUILD_DIR)/core_undef.txt))"
 
 $(RUNTIME_DYLIB): libmemx3.m include/memx_runtime.h $(CORE_LIB) | $(BUILD_DIR)
 	$(CC) -dynamiclib $(CPPFLAGS) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $< $(CORE_LIB)
