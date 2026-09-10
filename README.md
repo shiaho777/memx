@@ -258,6 +258,22 @@ memx_runtime_capsule_verify(&bad, &pages);
 
 `make test-capsule-segments` gates the path end-to-end (two named segments + one unnamed allocation, bitexact by-name materialize, clean verify).
 
+### Unprivileged store service (memx_stored)
+
+A per-user service hosts the engine and the capsule persistence plane — no root, no entitlements:
+
+```bash
+make stored && ./build/memx_stored          # foreground; or launchd:
+cp build/memx_stored /usr/local/bin/        # optional, for the plist
+launchctl load ~/Library/LaunchAgents/com.memx.stored.plist  # after installing tools/com.memx.stored.plist
+```
+
+- Socket: `~/Library/Application Support/MemX/store/store.sock` (0600), single-instance lock file, `SIGTERM`-clean.
+- Protocol (length-prefixed frames over UDS): `PUT <name> <page-aligned bytes>` (buffered in the service), `GET <name>` (bitexact), `LIST`, `DROP <name>`, `COMIT` (host engine compresses all segments and exports an immutable capsule generation `store/gen-NNNNNN` with manifest), `VERIY <gen>` (full CRC verify), `STAT`, `QUIT`.
+- Python SDK: `python/memx_store.py` — `Store(sock).put/get/list/drop/commit/verify/stats` (context-manager).
+- Update = new generation dir (APFS clone keeps unchanged pages cheap); concurrency = many readers / one writer by convention.
+- `make test-store-service` runs the full gate: private server instance → put/get bitexact → list/drop → commit → verify clean → cross-process `capsule_materialize_segment` bitexact.
+
 ### Non-destructive materialize and archives
 
 Fault/decompress can **consume** compressed pool data into HOT residency. For read-mostly weight strips that is often wrong.

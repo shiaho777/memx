@@ -113,11 +113,65 @@ struct ContentView: View {
                 Divider().padding(.horizontal, 20)
                 processSection
                 Divider().padding(.horizontal, 20)
+                storeServiceSection
+                Divider().padding(.horizontal, 20)
                 capsuleSection
                 Divider().padding(.horizontal, 20)
                 infoSection
             }
             .padding(20)
+        }
+    }
+
+    // MARK: - Store Service
+
+    private var storeServiceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Store Service")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(appState.storeRunning ? Color.green : Color.gray.opacity(0.5))
+                        .frame(width: 7, height: 7)
+                    Text(appState.storeRunning ? "running" : "stopped")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(appState.storeRunning ? .green : .secondary)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    appState.storeStart()
+                } label: {
+                    Label("Start", systemImage: "play.fill")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .disabled(appState.storeRunning)
+
+                Button {
+                    appState.storeStop()
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .disabled(!appState.storeRunning)
+            }
+
+            if appState.storeStats.isEmpty {
+                Text("Unprivileged capsule store · PUT/GET/LIST/COMMIT/VERIFY over UDS")
+                    .font(.system(size: 9))
+                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+            } else {
+                Text(appState.storeStats)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
         }
     }
 
