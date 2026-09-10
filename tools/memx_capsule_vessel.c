@@ -1,4 +1,5 @@
 #include "memx_runtime.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,15 +28,17 @@ int main(int argc, char **argv) {
     int pages = 16;
     int batch = 1;
     int ultra = 1;
+    int verify_only = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
         else if (strcmp(argv[i], "--pages") == 0 && i + 1 < argc) pages = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) batch = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ultra") == 0 && i + 1 < argc) ultra = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--verify") == 0) verify_only = 1;
         else if (!dir) dir = argv[i];
     }
     if (!dir || !dir[0]) {
-        fprintf(stderr, "usage: memx_capsule_vessel --dir <capsule_dir> [--pages N]\n");
+        fprintf(stderr, "usage: memx_capsule_vessel --dir <capsule_dir> [--pages N] [--verify]\n");
         return 2;
     }
     if (pages < 1) pages = 1;
@@ -43,6 +46,23 @@ int main(int argc, char **argv) {
     if (!getenv("MEMX_NO_SELFTEST")) setenv("MEMX_NO_SELFTEST", "1", 0);
     if (!getenv("MEMX_CAPSULE_LITE")) setenv("MEMX_CAPSULE_LITE", "1", 0);
     if (!getenv("MEMX_CPU_ONLY")) setenv("MEMX_CPU_ONLY", "1", 0);
+    if (verify_only) {
+        if (memx_runtime_capsule_attach(dir) != 0) {
+            fprintf(stderr, "VESSEL_ATTACH_FAIL\n");
+            return 1;
+        }
+        uint64_t bad = 0, total = 0;
+        int rc = memx_runtime_capsule_verify(&bad, &total);
+        printf("VESSEL_OK=1\n");
+        printf("VESSEL_VERIFY_RC=%d\n", rc);
+        printf("VESSEL_VERIFY_BAD=%llu\n", (unsigned long long)bad);
+        printf("VESSEL_VERIFY_PAGES=%llu\n", (unsigned long long)total);
+        if (rc == 0) printf("VESSEL_VERIFY_STATUS=OK\n");
+        else if (rc == EBADMSG) printf("VESSEL_VERIFY_STATUS=CORRUPT\n");
+        else printf("VESSEL_VERIFY_STATUS=UNSUPPORTED\n");
+        (void)memx_runtime_capsule_detach();
+        return rc == 0 ? 0 : 1;
+    }
     int r0 = rss_mb();
     int p0 = phys_mb();
     if (memx_runtime_capsule_attach(dir) != 0) {

@@ -373,8 +373,12 @@ static void note_page_compressed(MemXZone3 *s, size_t page_index, uint8_t codec,
 
 // ─── Shared stats export for GUI dashboard ───
 typedef struct {
-    uint32_t magic;       // 0x4D585331 ('MXS1')
+    uint32_t magic;       // 0x4D585332 ('MXS2')
+    uint16_t struct_version; // 2
+    uint16_t _pad0;
     uint32_t pid;         // process ID
+    uint64_t update_seq;  // monotonic per update (staleness detection)
+    uint64_t update_ns;   // CLOCK_MONOTONIC_RAW at last update
     uint64_t compressions;
     uint64_t faults;
     uint64_t bytes_saved;
@@ -386,12 +390,16 @@ typedef struct {
     uint64_t npages;      // total pages managed
     uint64_t npages_compressed; // pages currently compressed
     uint64_t npages_resident;   // pages currently resident
-    uint64_t _reserved[8];
+    uint64_t hot_pages;   // pages currently PAGE_HOT
+    uint64_t spill_bytes; // durable spill size
+    uint64_t live_contexts;     // live allocation contexts
+    uint64_t _reserved[4];
 } MemXSharedStats;
-#define MEMX_SHARED_MAGIC 0x4D585331
+#define MEMX_SHARED_MAGIC 0x4D585332
 static MemXSharedStats *g_shared_stats = NULL;
 static char g_shared_stats_path[256];
 static uint64_t pool_reclaim_pending_locked(MemXZone3 *s);
+static int g_live_context_count(void);
 
 static void shared_stats_init(MemXZone3 *s) {
     snprintf(g_shared_stats_path, sizeof(g_shared_stats_path), "/tmp/memx_stats_%d", getpid());
@@ -403,11 +411,14 @@ static void shared_stats_init(MemXZone3 *s) {
     if (g_shared_stats == MAP_FAILED) { g_shared_stats = NULL; return; }
     memset(g_shared_stats, 0, sizeof(MemXSharedStats));
     g_shared_stats->magic = MEMX_SHARED_MAGIC;
+    g_shared_stats->struct_version = 2;
     g_shared_stats->pid = getpid();
 }
 
 static void shared_stats_update(MemXZone3 *s) {
     if (!g_shared_stats) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     g_shared_stats->compressions = s->compressions;
     g_shared_stats->faults = s->faults;
     g_shared_stats->bytes_saved = s->bytes_saved;
@@ -421,6 +432,11 @@ static void shared_stats_update(MemXZone3 *s) {
     g_shared_stats->vmem_size = (nc + nr) * PAGE_SZ / MB;
     g_shared_stats->pool_used = s->pool_used;               // compressed pool bytes used
     g_shared_stats->npages = s->npages;
+    g_shared_stats->hot_pages = s->live_hot_flag_pages;
+    g_shared_stats->spill_bytes = s->pool_spill_bytes;
+    g_shared_stats->live_contexts = (uint64_t)g_live_context_count();
+    g_shared_stats->update_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    g_shared_stats->update_seq++;
 }
 
 static void shared_stats_cleanup(void) {
@@ -430,6 +446,9 @@ static void shared_stats_cleanup(void) {
 
 static MemXZone3 *g_z = NULL;
 static __thread int in_memx = 0;  // Per-thread recursion guard
+static volatile int g_live_contexts = 0;
+
+static int g_live_context_count(void) { return g_live_contexts; }
 
 static inline memx_runtime_context_t *context_from_tag(uintptr_t owner_tag) {
     memx_runtime_context_t *ctx = (memx_runtime_context_t *)owner_tag;
@@ -4996,6 +5015,10 @@ static void *bg_compressor(void *arg) {
         }
         uint8_t page_valid[BATCH];
         uint32_t page_seq[BATCH];
+        {
+            static uint32_t busy_flush_tick = 0;
+            if ((++busy_flush_tick & 15u) == 0) shared_stats_update(s);
+        }
         memset(page_valid, 0, nc);
         memset(page_seq, 0, sizeof(uint32_t) * nc);
         for(size_t i=0;i<nc;) {
@@ -6287,6 +6310,7 @@ int memx_runtime_context_create(const char *name, memx_runtime_context_t **out_c
     ctx->epoch_gen = 0;
     ctx->hot_budget_bytes = 0;
     ctx->ws_hot_bytes = 0;
+    __sync_fetch_and_add(&g_live_contexts, 1);
     *out_ctx = ctx;
     return 0;
 }
@@ -6299,6 +6323,7 @@ int memx_runtime_context_destroy(memx_runtime_context_t *ctx) {
         ctx->ws_mutex_inited = 0;
     }
     ctx->magic = 0;
+    __sync_fetch_and_sub(&g_live_contexts, 1);
     real_free(ctx);
     return 0;
 }

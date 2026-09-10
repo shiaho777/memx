@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @EnvironmentObject var appState: AppState
@@ -112,9 +113,108 @@ struct ContentView: View {
                 Divider().padding(.horizontal, 20)
                 processSection
                 Divider().padding(.horizontal, 20)
+                capsuleSection
+                Divider().padding(.horizontal, 20)
                 infoSection
             }
             .padding(20)
+        }
+    }
+
+    // MARK: - Capsule Browser
+
+    private var capsuleSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Capsule Store")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                if appState.capsule.valid {
+                    Text("v\(appState.capsule.version)")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.message = "Select a capsule directory (spill.bin / ledger.bin)"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        appState.loadCapsule(atPath: url.path)
+                    }
+                } label: {
+                    Label("Browse…", systemImage: "folder")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+
+                if appState.capsule.valid {
+                    Button {
+                        appState.verifyCapsule()
+                    } label: {
+                        Label("Verify", systemImage: "checkmark.shield")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    Text(appState.capsule.verifyStatus)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(appState.capsule.verifyStatus == "ok" ? .green :
+                                         appState.capsule.verifyStatus == "corrupt" ? .red : .secondary)
+                }
+            }
+
+            if appState.capsule.path.isEmpty {
+                Text("No capsule selected")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+            } else if !appState.capsule.valid {
+                Text("Not a valid capsule: \(appState.capsule.verifyDetail)")
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(URL(fileURLWithPath: appState.capsule.path).lastPathComponent)
+                        .font(.system(size: 11, weight: .medium))
+                    Text(String(format: "%lld pages · %.1f MB logical · %.1f MB spill",
+                                appState.capsule.entCount,
+                                Double(appState.capsule.pageBytes) / 1048576.0,
+                                Double(appState.capsule.spillBytes) / 1048576.0))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    if !appState.capsule.verifyDetail.isEmpty {
+                        Text(appState.capsule.verifyDetail)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.orange)
+                    }
+                }
+
+                if appState.capsule.hasManifest {
+                    ForEach(appState.capsule.segments) { seg in
+                        HStack {
+                            Image(systemName: "square.stack.3d.up")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                            Text(seg.name)
+                                .font(.system(size: 10, design: .monospaced))
+                            Spacer()
+                            Text(String(format: "%lldp · %.1f MB", seg.pages, Double(seg.nbytes) / 1048576.0))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(4)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                } else {
+                    Text("No manifest (unnamed capsule)")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color(nsColor: .tertiaryLabelColor))
+                }
+            }
         }
     }
     
