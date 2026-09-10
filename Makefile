@@ -18,7 +18,7 @@ EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -37,6 +37,24 @@ $(CORE_TEST): tests/test_core_kernel.c $(CORE_LIB) | $(BUILD_DIR)
 
 core-test: $(CORE_TEST)
 	@$(CORE_TEST)
+
+CORE_SIM = $(BUILD_DIR)/test_core_kernel_sim
+CORE_SIM_4K = $(BUILD_DIR)/test_core_kernel_sim_4k
+CORE_LIB_4K = $(BUILD_DIR)/libmemx_core_4k.a
+
+$(CORE_LIB_4K): core/memx_core.c core/memx_core.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -DMEMX_CORE_PAGE_SZ=4096 -c -o $(BUILD_DIR)/memx_core_4k.o core/memx_core.c
+	ar rcs $@ $(BUILD_DIR)/memx_core_4k.o
+
+$(CORE_SIM): tests/test_core_kernel_sim.c $(CORE_LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Icore -o $@ $< $(CORE_LIB)
+
+$(CORE_SIM_4K): tests/test_core_kernel_sim.c $(CORE_LIB_4K) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Icore -DMEMX_CORE_PAGE_SZ=4096 -o $@ $< $(CORE_LIB_4K)
+
+core-sim: $(CORE_SIM) $(CORE_SIM_4K)
+	@$(CORE_SIM)
+	@$(CORE_SIM_4K)
 
 core-audit:
 	@$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem core/shims -isystem $(CLANG_RESOURCE)/include -c -o $(BUILD_DIR)/memx_core_fs.o core/memx_core.c

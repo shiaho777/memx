@@ -423,8 +423,8 @@ void memx_interleave_lo_hi(const uint8_t *lo, const uint8_t *hi, uint8_t *dst, u
 void wait_decompress_complete(PageMeta *m) {
     if (!m) return;
     for (;;) {
-        uint8_t st = __atomic_load_n(&m->state, __ATOMIC_ACQUIRE);
-        uint32_t cs = __atomic_load_n(&m->comp_size, __ATOMIC_ACQUIRE);
+        uint8_t st = MEMX_CORE_ATOMIC_LOAD_ACQ(&m->state);
+        uint32_t cs = MEMX_CORE_ATOMIC_LOAD_ACQ(&m->comp_size);
         if (st != MEMX_PAGE_HOT && st != MEMX_PAGE_COMPRESSED) return;
         if (st == MEMX_PAGE_HOT && cs == 0) return;
         if (st == MEMX_PAGE_COMPRESSED) return;

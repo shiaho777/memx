@@ -39,6 +39,7 @@
 #include <arm_neon.h>
 #endif
 
+_Static_assert(PAGE_SZ == 16384, "macOS runtime requires the 16K core page size");
 _Static_assert(MEMX_ROLE_UNKNOWN == MEMX_TENSOR_ROLE_UNKNOWN, "role");
 _Static_assert(MEMX_ROLE_WEIGHT == MEMX_TENSOR_ROLE_WEIGHT, "role");
 _Static_assert(MEMX_ROLE_KV_CACHE == MEMX_TENSOR_ROLE_KV_CACHE, "role");
