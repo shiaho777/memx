@@ -12,7 +12,11 @@ mkdir -p "$BUILD_DIR"
 
 # Build dylib
 echo "Building libmemx_runtime.dylib..."
-make explicit-runtime
+make explicit-runtime CC="${CC:-clang}"
+
+# Build vessel (verify backend for the capsule browser)
+echo "Building memx_capsule_vessel..."
+make capsule-vessel CC="${CC:-clang}"
 
 # Build app
 echo "Building MemXApp..."
@@ -21,15 +25,17 @@ xcodebuild -project MemXApp.xcodeproj -scheme MemXApp -configuration Release bui
     SYMROOT="$XCODE_BUILD_DIR" \
     2>&1 | tail -3
 
-# Copy dylib into app bundle
+# Copy dylib + vessel into app bundle
 APP_PATH="$XCODE_BUILD_DIR/Release/MemXApp.app"
 
 if [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ]; then
     cp "$DYLIB_PATH" "$APP_PATH/Contents/MacOS/"
+    cp "$BUILD_DIR/memx_capsule_vessel" "$APP_PATH/Contents/MacOS/"
     rm -rf "$APP_OUTPUT"
     cp -R "$APP_PATH" "$APP_OUTPUT"
     echo "✅ App ready: $APP_OUTPUT"
     echo "   Dylib: $(ls -la "$APP_PATH/Contents/MacOS/libmemx_runtime.dylib" | awk '{print $5}') bytes"
+    echo "   Vessel: $(ls -la "$APP_PATH/Contents/MacOS/memx_capsule_vessel" | awk '{print $5}') bytes"
 else
     echo "❌ Could not find built app"
     exit 1

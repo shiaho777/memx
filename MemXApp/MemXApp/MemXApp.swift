@@ -1,5 +1,25 @@
 import SwiftUI
 
+struct CapsuleSegment: Identifiable {
+    let id = UUID()
+    let name: String
+    let pages: Int64
+    let nbytes: Int64
+}
+
+struct CapsuleInfo {
+    var path: String = ""
+    var valid = false
+    var version: UInt32 = 0
+    var entCount: UInt64 = 0
+    var spillBytes: UInt64 = 0
+    var pageBytes: UInt64 = 0
+    var segments: [CapsuleSegment] = []
+    var hasManifest = false
+    var verifyStatus: String = "not verified"
+    var verifyDetail: String = ""
+}
+
 @main
 struct MemXApp: App {
     @StateObject private var appState = AppState()
@@ -34,8 +54,10 @@ class AppState: ObservableObject {
     @Published var lastRefreshAt: Date?
     @Published var outputLog: [LogEntry] = []
     @Published var activeProcesses: [ActiveProcess] = []
+    @Published var capsule = CapsuleInfo()
     private var monitorTimer: Timer?
     private var lastObservedPIDs: Set<Int32> = []
+    private var lastLivePids: Set<Int32> = []
     private var didLogInitialState = false
     
     // MARK: - Types
@@ -61,6 +83,10 @@ class AppState: ObservableObject {
         var expansionRatio: Double = 0
         var integrityOK: Bool = true
         var processCount: Int = 0
+        var compressedPages: Int64 = 0
+        var hotPages: Int64 = 0
+        var spillMB: Int64 = 0
+        var liveContexts: Int64 = 0
     }
     
     struct ActiveProcess: Identifiable {
@@ -129,7 +155,7 @@ class AppState: ObservableObject {
     private func scanGlobalStats() {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: "/tmp") else { return }
-        
+
         var totalCompressions: Int64 = 0
         var totalFaults: Int64 = 0
         var totalBytesSaved: Int64 = 0
@@ -139,35 +165,70 @@ class AppState: ObservableObject {
         var totalVirtualMB: Int64 = 0
         var totalPoolUsed: Int64 = 0
         var totalPagesResident: Int64 = 0
+        var totalCompressedPages: Int64 = 0
+        var totalHotPages: Int64 = 0
+        var totalSpillBytes: Int64 = 0
+        var totalLiveContexts: Int64 = 0
+        var livePids = Set<Int32>()
         var processCount = 0
-        
-        let magic: UInt32 = 0x4D585331
-        let statsSize = 160
-        
+
+        let magicV2: UInt32 = 0x4D585332
+        let magicV1: UInt32 = 0x4D585331
+        let statsSizeV2 = 176
+        let statsSizeV1 = 160
+
         for file in files {
             guard file.hasPrefix("memx_stats_") else { continue }
             let path = "/tmp/" + file
-            guard let data = fm.contents(atPath: path), data.count >= statsSize else { continue }
-            
+            guard let data = fm.contents(atPath: path), data.count >= 8 else { continue }
+
             data.withUnsafeBytes { rawBuf in
                 guard let base = rawBuf.baseAddress else { return }
                 let ptr = base.assumingMemoryBound(to: UInt32.self)
-                guard ptr.pointee == magic else { return }
-                
-                let fieldBase = base.assumingMemoryBound(to: UInt64.self) + 1
-                totalCompressions += Int64(fieldBase[0])
-                totalFaults += Int64(fieldBase[1])
-                totalBytesSaved += Int64(fieldBase[2])
-                totalDedupHits += Int64(fieldBase[3])
-                totalPrefetchCount += Int64(fieldBase[4])
-                totalPrefetchHits += Int64(fieldBase[5])
-                totalVirtualMB += Int64(fieldBase[6])
-                totalPoolUsed += Int64(fieldBase[7])
-                totalPagesResident += Int64(fieldBase[10])
+                let magic = ptr.pointee
+                guard magic == magicV2 || magic == magicV1 else { return }
+                // v2: magic u32 | ver u16 | pad u16 | pid u32 | pad u32 | u64 fields
+                // v1: magic u32 | pid u32 | u64 fields
+                let pid = Int32(bitPattern: magic == magicV2 ? ptr[2] : ptr[1])
+                guard kill(pid, 0) == 0 || errno == EPERM else { return }
+                livePids.insert(pid)
+
+                if magic == magicV2 {
+                    guard data.count >= statsSizeV2 else { return }
+                    // layout: magic u32 | ver u16 + pad u16 | pid u32 + pad u32 | u64 fields from offset 8
+                    let ver = ptr[1] & 0xFFFF
+                    guard ver == 2 else { return }
+                    let fieldBase = base.assumingMemoryBound(to: UInt64.self) + 1
+                    totalCompressions += Int64(fieldBase[3])
+                    totalFaults += Int64(fieldBase[4])
+                    totalBytesSaved += Int64(fieldBase[5])
+                    totalDedupHits += Int64(fieldBase[6])
+                    totalPrefetchCount += Int64(fieldBase[7])
+                    totalPrefetchHits += Int64(fieldBase[8])
+                    totalVirtualMB += Int64(fieldBase[9])
+                    totalPoolUsed += Int64(fieldBase[10])
+                    totalCompressedPages += Int64(fieldBase[12])
+                    totalPagesResident += Int64(fieldBase[13])
+                    totalHotPages += Int64(fieldBase[14])
+                    totalSpillBytes += Int64(fieldBase[15])
+                    totalLiveContexts += Int64(fieldBase[16])
+                } else {
+                    guard data.count >= statsSizeV1 else { return }
+                    let fieldBase = base.assumingMemoryBound(to: UInt64.self) + 1
+                    totalCompressions += Int64(fieldBase[0])
+                    totalFaults += Int64(fieldBase[1])
+                    totalBytesSaved += Int64(fieldBase[2])
+                    totalDedupHits += Int64(fieldBase[3])
+                    totalPrefetchCount += Int64(fieldBase[4])
+                    totalPrefetchHits += Int64(fieldBase[5])
+                    totalVirtualMB += Int64(fieldBase[6])
+                    totalPoolUsed += Int64(fieldBase[7])
+                    totalPagesResident += Int64(fieldBase[10])
+                }
                 processCount += 1
             }
         }
-        
+
         stats.compressions = totalCompressions
         stats.faults = totalFaults
         stats.bytesSaved = totalBytesSaved
@@ -176,7 +237,12 @@ class AppState: ObservableObject {
         stats.prefetchHits = totalPrefetchHits
         stats.virtualMB = totalVirtualMB
         stats.processCount = processCount
-        
+        stats.compressedPages = totalCompressedPages
+        stats.hotPages = totalHotPages
+        stats.spillMB = totalSpillBytes / (1024 * 1024)
+        stats.liveContexts = totalLiveContexts
+        lastLivePids = livePids
+
         if processCount > 0 {
             let physicalBytes = totalPagesResident * 16384 + totalPoolUsed
             stats.physicalMB = Int64(physicalBytes / (1024 * 1024))
@@ -193,51 +259,138 @@ class AppState: ObservableObject {
     // MARK: - Active Process List
     
     private func scanActiveProcesses() {
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(atPath: "/tmp") else { return }
-        
-        var procs: [ActiveProcess] = []
-        
-        for file in files {
-            guard file.hasPrefix("memx_stats_") else { continue }
-            let pidStr = file.replacingOccurrences(of: "memx_stats_", with: "")
-            guard let pid = Int32(pidStr) else { continue }
-            
-            // Get process name via ps
-            let task = Process()
-            let pipe = Pipe()
-            task.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task.arguments = ["-p", "\(pid)", "-o", "comm="]
-            task.standardOutput = pipe
-            try? task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let name = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "PID \(pid)"
-            
-            // Get RSS
-            let task2 = Process()
-            let pipe2 = Pipe()
-            task2.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task2.arguments = ["-p", "\(pid)", "-o", "rss="]
-            task2.standardOutput = pipe2
-            try? task2.run()
-            task2.waitUntilExit()
-            let data2 = pipe2.fileHandleForReading.readDataToEndOfFile()
-            let rssStr = String(data: data2, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-            let rssKB = Int64(rssStr) ?? 0
-            let rssMB = rssKB / 1024
-            
-            procs.append(ActiveProcess(pid: pid, name: name, memoryMB: rssMB, memxActive: true))
+        guard !lastLivePids.isEmpty else {
+            activeProcesses = []
+            return
         }
-        
+        let pidList = lastLivePids.map(String.init).sorted().joined(separator: ",")
+
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-p", pidList, "-o", "pid=,comm=,rss="]
+        task.standardOutput = pipe
+        do { try task.run() } catch { return }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return }
+
+        var procs: [ActiveProcess] = []
+        for line in text.split(separator: "\n") {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 3, let pid = Int32(fields[0]) else { continue }
+            let rssKB = Int64(fields[fields.count - 1]) ?? 0
+            let name = fields[1..<(fields.count - 1)].joined(separator: " ")
+            procs.append(ActiveProcess(pid: pid, name: name, memoryMB: rssKB / 1024, memxActive: true))
+        }
+
         activeProcesses = procs.sorted { lhs, rhs in
             if lhs.memoryMB == rhs.memoryMB { return lhs.pid < rhs.pid }
             return lhs.memoryMB > rhs.memoryMB
         }
     }
     
-    // MARK: - Logging
-    
+    // MARK: - Capsule Browser
+
+    func loadCapsule(atPath path: String) {
+        var info = CapsuleInfo()
+        info.path = path
+        let fm = FileManager.default
+
+        guard let led = fm.contents(atPath: path + "/ledger.bin"), led.count >= 72 else {
+            info.verifyDetail = "ledger.bin missing or truncated"
+            capsule = info
+            return
+        }
+        led.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            let u32 = base.assumingMemoryBound(to: UInt32.self)
+            guard u32[0] == 0x4D584350 else { return }
+            info.version = u32[1]
+            let u64 = base.assumingMemoryBound(to: UInt64.self)
+            info.entCount = u64[1]
+            info.spillBytes = u64[2]
+            info.pageBytes = u64[3]
+            info.valid = true
+        }
+
+        if let man = fm.contents(atPath: path + "/manifest.bin"), man.count >= 16 {
+            man.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                let u32 = base.assumingMemoryBound(to: UInt32.self)
+                guard u32[0] == 0x4D585347, u32[1] == 1 else { return }
+                let count = Int(u32[2])
+                var segs: [CapsuleSegment] = []
+                let entrySize = 88
+                for i in 0..<min(count, 128) {
+                    let off = 16 + i * entrySize
+                    guard man.count >= off + entrySize else { break }
+                    man.withUnsafeBytes { r2 in
+                        guard let b2 = r2.baseAddress else { return }
+                        let nameEnd = off + 64
+                        var nameBytes: [UInt8] = []
+                        for j in off..<nameEnd {
+                            let c = man[man.index(man.startIndex, offsetBy: j)]
+                            if c == 0 { break }
+                            nameBytes.append(c)
+                        }
+                        guard let name = String(bytes: nameBytes, encoding: .utf8), !name.isEmpty else { return }
+                        let b32 = (b2 + nameEnd).assumingMemoryBound(to: UInt32.self)
+                        let b64 = (b2 + nameEnd).assumingMemoryBound(to: UInt64.self)
+                        let pages = UInt64(b32[1])
+                        let nbytes = b64[2]
+                        segs.append(CapsuleSegment(name: name, pages: Int64(pages), nbytes: Int64(nbytes)))
+                    }
+                }
+                info.segments = segs
+                info.hasManifest = true
+            }
+        }
+
+        info.verifyStatus = "not verified"
+        info.verifyDetail = ""
+        capsule = info
+    }
+
+    func verifyCapsule() {
+        guard capsule.valid else { return }
+        let vesselPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/memx_capsule_vessel").path
+        guard FileManager.default.fileExists(atPath: vesselPath) else {
+            capsule.verifyStatus = "unavailable"
+            capsule.verifyDetail = "vessel binary not bundled"
+            return
+        }
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: vesselPath)
+        task.arguments = ["--dir", capsule.path, "--verify"]
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do { try task.run() } catch {
+            capsule.verifyStatus = "error"
+            capsule.verifyDetail = error.localizedDescription
+            return
+        }
+        task.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        var status = "unknown"
+        var bad = ""
+        var pages = ""
+        for line in out.split(separator: "\n") {
+            if line.hasPrefix("VESSEL_VERIFY_STATUS=") {
+                status = String(line.dropFirst("VESSEL_VERIFY_STATUS=".count))
+            } else if line.hasPrefix("VESSEL_VERIFY_BAD=") {
+                bad = String(line.dropFirst("VESSEL_VERIFY_BAD=".count))
+            } else if line.hasPrefix("VESSEL_VERIFY_PAGES=") {
+                pages = String(line.dropFirst("VESSEL_VERIFY_PAGES=".count))
+            }
+        }
+        capsule.verifyStatus = status.lowercased()
+        capsule.verifyDetail = pages.isEmpty ? "" : "\(bad)/\(pages) pages failed CRC"
+    }
+
+    // MARK: - Logging    
     private func recordMonitorActivity(trigger: String) {
         let currentPIDs = Set(activeProcesses.map(\.pid))
         if !didLogInitialState {
