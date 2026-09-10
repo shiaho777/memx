@@ -122,7 +122,16 @@ int main(int argc, char **argv) {
             return 7;
         }
         if (verify_with_heal(ctx, a, golden_a, A_BYTES) != 0) return 8;
-        printf("generic engine cpu-only: OK forced=%llu\n", (unsigned long long)done);
+        sleep(3);
+        memx_runtime_stats_t st;
+        if (memx_runtime_get_stats(&st) != 0) return 14;
+        if (st.res_list_entries > (uint64_t)A_PAGES * 4ull) {
+            fprintf(stderr, "res_list polluted: entries=%llu pages=%llu\n",
+                    (unsigned long long)st.res_list_entries, (unsigned long long)A_PAGES);
+            return 15;
+        }
+        printf("generic engine cpu-only: OK forced=%llu res_entries=%llu\n",
+               (unsigned long long)done, (unsigned long long)st.res_list_entries);
     } else {
         memx_runtime_tensor_desc_t desc;
         memset(&desc, 0, sizeof(desc));

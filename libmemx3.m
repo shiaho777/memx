@@ -3228,9 +3228,13 @@ static int context_preflight_locked(uintptr_t owner_tag, size_t size, size_t npa
 
 // ─── Active page list helpers ───
 static inline void hot_list_add(MemXZone3 *s, uint32_t page) {
+    if (__sync_lock_test_and_set(&s->meta[page].in_hot_list, 1)) return;
     for (;;) {
         uint32_t n = s->hot_count;
-        if (n >= s->hot_cap) return;
+        if (n >= s->hot_cap) {
+            s->meta[page].in_hot_list = 0;
+            return;
+        }
         if (__sync_bool_compare_and_swap(&s->hot_count, n, n + 1)) {
             s->hot_list[n] = page;
             return;
@@ -3238,9 +3242,13 @@ static inline void hot_list_add(MemXZone3 *s, uint32_t page) {
     }
 }
 static inline void res_list_add(MemXZone3 *s, uint32_t page) {
+    if (__sync_lock_test_and_set(&s->meta[page].in_res_list, 1)) return;
     for (;;) {
         uint32_t n = s->res_count;
-        if (n >= s->res_cap) return;
+        if (n >= s->res_cap) {
+            s->meta[page].in_res_list = 0;
+            return;
+        }
         if (__sync_bool_compare_and_swap(&s->res_count, n, n + 1)) {
             s->res_list[n] = page;
             return;
@@ -5035,6 +5043,7 @@ static void *bg_compressor(void *arg) {
                                 if (page_wants_write_protect(&s->meta[pi])) {
                                     mprotect((uint8_t*)s->vmem + (size_t)pi * PAGE_SZ, PAGE_SZ, PROT_READ);
                                 }
+                                s->meta[pi].in_hot_list = 0;
                                 res_list_add(s, pi);
                             }
                         } else {
@@ -5045,6 +5054,9 @@ static void *bg_compressor(void *arg) {
                 }
             }
             // else: page was freed or transitioned by fault handler, drop from list
+            else {
+                s->meta[pi].in_hot_list = 0;
+            }
         }
         s->hot_count = new_hot;
         
@@ -5055,7 +5067,9 @@ static void *bg_compressor(void *arg) {
         for(uint32_t i=0; i<rc && s->running; i++) {
             uint32_t pi = s->res_list[i];
             if(s->meta[pi].state==PAGE_RESIDENT) {
-                if ((s->meta[pi].tensor_flags & (MEMX_TENSOR_FLAG_HOT | MEMX_TENSOR_FLAG_NO_COMPRESS)) == 0) {
+                if (s->meta[pi].cooldown > 0) {
+                    s->meta[pi].cooldown--;
+                } else if ((s->meta[pi].tensor_flags & (MEMX_TENSOR_FLAG_HOT | MEMX_TENSOR_FLAG_NO_COMPRESS)) == 0) {
                     int cold_pri = (s->meta[pi].tensor_flags & (MEMX_TENSOR_FLAG_COLD | MEMX_TENSOR_FLAG_READ_MOSTLY)) != 0;
                     int llm_pri =
                         s->meta[pi].tensor_role == MEMX_TENSOR_ROLE_KV_CACHE ||
@@ -5067,6 +5081,8 @@ static void *bg_compressor(void *arg) {
                 }
                 if (new_res != i) s->res_list[new_res] = pi;
                 new_res++;
+            } else {
+                s->meta[pi].in_res_list = 0;
             }
         }
         if (npc > 0) {
@@ -5082,6 +5098,8 @@ static void *bg_compressor(void *arg) {
             uint32_t pi = s->res_list[i];
             if(s->meta[pi].state==PAGE_RESIDENT) {
                 s->res_list[new_res++] = pi;
+            } else {
+                s->meta[pi].in_res_list = 0;
             }
         }
         s->res_count = new_res;
@@ -5333,6 +5351,7 @@ static void *bg_compressor(void *arg) {
                     int coldish = (tflags & (MEMX_TENSOR_FLAG_COLD | MEMX_TENSOR_FLAG_READ_MOSTLY)) != 0;
                     if (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish) {
                         s->meta[pidx].stable_ticks = 8;
+                        s->meta[pidx].cooldown = 16;
                         restore_compressing_page(s, pidx);
                         page_valid[i] = 0;
                     } else {
@@ -5367,6 +5386,7 @@ static void *bg_compressor(void *arg) {
                         size_t orig_i = gpu_map[gi];
                         if (!page_valid[orig_i]) {
                             s->meta[tc[orig_i]].stable_ticks = 8;
+                            s->meta[tc[orig_i]].cooldown = 16;
                             restore_compressing_page(s, tc[orig_i]);
                         }
                     }
@@ -5399,6 +5419,7 @@ static void *bg_compressor(void *arg) {
                     max_cs = (PAGE_SZ * 15) / 16;
                 }
                 if (cs == 0 || cs >= PAGE_SZ || cs >= max_cs) {
+                    s->meta[pidx].cooldown = 16;
                     restore_compressing_page(s, pidx);
                     continue;
                 }
@@ -5788,6 +5809,8 @@ static void runtime_managed_free_internal(void *ptr) {
         g_z->meta[i].codec = 0;
         g_z->meta[i].comp_size = 0;
         g_z->meta[i].pool_offset = 0;
+        g_z->meta[i].in_res_list = 0;
+        g_z->meta[i].in_hot_list = 0;
         g_z->meta[i].owner_tag = 0;
         g_z->meta[i].tensor_role = MEMX_TENSOR_ROLE_UNKNOWN;
         g_z->meta[i].tensor_dtype = MEMX_TENSOR_DTYPE_UNKNOWN;
@@ -9221,6 +9244,8 @@ int memx_runtime_get_stats(memx_runtime_stats_t *out_stats) {
     out_stats->tensor_delta_split_bytes_saved = g_z->tensor_delta_split_bytes_saved;
     out_stats->tensor_exp_pack_pages = g_z->tensor_exp_pack_pages;
     out_stats->tensor_exp_pack_bytes_saved = g_z->tensor_exp_pack_bytes_saved;
+    out_stats->res_list_entries = g_z->res_count;
+    out_stats->hot_list_entries = g_z->hot_count;
     out_stats->running = 1;
     return 0;
 }
