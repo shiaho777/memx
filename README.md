@@ -217,6 +217,25 @@ MemX is not LLM-only. Any large managed allocation can use the compressed reside
 
 Known limitation: incompressible generic pages (e.g. random bytes) are stored raw and retried by the background compressor each pass — see the res_list churn issue for the tracking of the retry/pollution behavior.
 
+### Kernel-grade core
+
+The codec layer and page state machine live in `core/memx_core.{h,c}` — a
+freestanding, kernel-constrainable core (`make core-audit` proves the undefined
+symbols are exactly the `memcpy` family). The macOS runtime links this same
+archive, so the engine you use per-process is verifiably the kernel-grade core
+plus platform services.
+
+Embedding into a kernel you control: `core/EMBEDDING.md` is the contract —
+you provide fault delivery, page protection, serialization, memory, and the
+zlib inflate/uncompress hooks; the core provides codecs, the universal decoder,
+and the compression commit protocol. NEON paths all have scalar fallbacks
+(`MEMX_FORCE_SCALAR`), and zlib-bound encoders stay runtime-side.
+
+Third-party kernel embedding on macOS itself is not possible (kext requires
+Apple entitlements + reduced security, contradicting the no-privileges goal);
+the unprivileged story is the per-process dylib, the capsule persistence plane,
+and a management app.
+
 ### Device persistence (snapshot store)
 
 Capsules double as an on-device persistence plane for arbitrary managed memory, with named segments:
