@@ -18,7 +18,7 @@ EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -55,6 +55,19 @@ $(CORE_SIM_4K): tests/test_core_kernel_sim.c $(CORE_LIB_4K) | $(BUILD_DIR)
 core-sim: $(CORE_SIM) $(CORE_SIM_4K)
 	@$(CORE_SIM)
 	@$(CORE_SIM_4K)
+
+POSIX_TEST = $(BUILD_DIR)/test_posix_adapter
+POSIX_TEST_4K = $(BUILD_DIR)/test_posix_adapter_4k
+
+$(POSIX_TEST): tests/test_posix_adapter.c platform/posix/memx_posix.c platform/posix/memx_posix.h $(CORE_LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Icore -Iplatform/posix -o $@ tests/test_posix_adapter.c platform/posix/memx_posix.c $(CORE_LIB) -lpthread
+
+$(POSIX_TEST_4K): tests/test_posix_adapter.c platform/posix/memx_posix.c platform/posix/memx_posix.h $(CORE_LIB_4K) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Icore -Iplatform/posix -DMEMX_CORE_PAGE_SZ=4096 -o $@ tests/test_posix_adapter.c platform/posix/memx_posix.c $(CORE_LIB_4K) -lpthread
+
+posix-adapter: $(POSIX_TEST) $(POSIX_TEST_4K)
+	@$(POSIX_TEST)
+	@$(POSIX_TEST_4K)
 
 core-audit:
 	@$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem core/shims -isystem $(CLANG_RESOURCE)/include -c -o $(BUILD_DIR)/memx_core_fs.o core/memx_core.c

@@ -56,7 +56,7 @@ reference embedder with zero OS services.
 
 | Concern | Knob | Notes |
 |---------|------|-------|
-| Page size | `-DMEMX_CORE_PAGE_SZ=N` | Power of two, ≥ 2048 in practice. Format sizes are self-describing per page, but a build only decodes its own page size; the capsule header carries `page_sz` for detection. The macOS runtime pins 16K (static assert). |
+| Page size | `-DMEMX_CORE_PAGE_SZ=N` | Power of two, ≥ 2048 in practice. Format sizes are self-describing per page, but a build only decodes its own page size; the capsule header carries `page_sz` for detection. The macOS runtime pins 16K (static assert). **Constraint: for protection-driven runtimes the logical page must be ≥ the hardware page** (mprotect granularity) — 4K logical builds need 4K-hardware platforms (Linux x86_64); the POSIX adapter enforces this at init (`rc == -2`). |
 | Atomics | `MEMX_CORE_ATOMIC_LOAD_ACQ` | Defaults to GCC/Clang `__atomic_load_n`; redefine for exotic toolchains (e.g. MSVC `_InterlockedCompareExchange`-family shims). All state transitions are plain CAS — map to the target's `cmpxchg`. |
 | SIMD | `MEMX_FORCE_SCALAR` | Every NEON path has a scalar fallback. Required where kernel FP/SIMD context is not guaranteed (Linux `kernel_neon_begin/end`, XNU FP save). |
 | zlib | hook vtable or omit | Without hooks only the zlib-free codecs + generic decode are available; encode-side zlib stays in the host adapter anyway. |
@@ -71,12 +71,23 @@ core/                 ← kernel-grade core (this directory, OS-free)
 <os>-adapter/         ← fault delivery + protection + (optional) pool/file services
 ```
 
-The macOS adapter is `libmemx3.m` (signal-driven faults, mprotect handshake,
-Metal-assisted compression, capsule files). A Linux adapter would map the same
-contract onto `userfaultfd` for fault delivery (register ranges, resolve
-`UFFD_EVENT_PAGEFAULT` → decompress-install) and use its own page-size choice
-(the 4K build of the core is proven by `core-sim`). An RTOS adapter can run the
-single-threaded compressor loop exactly like the reference sim does.
+Two adapters exist today:
+
+- **macOS** — `libmemx3.m` (the full-featured runtime): sigaction fault
+  delivery, mprotect handshake, Metal-assisted compression, capsule files.
+- **POSIX** — `platform/posix/memx_posix.c` (the minimal reference runtime):
+  sigaction fault delivery (SIGSEGV + SIGBUS), the same mprotect handshake,
+  one compressor thread, a bump arena. Builds at any core page size; gates
+  itself out when the hardware page is larger than the logical page (4K
+  logical on a 16K-hardware machine cannot use mprotect granularity — it
+  fails init with `rc == -2` instead of corrupting silently). Runs end-to-end
+  on Linux x86_64 CI at 4K (`make posix-adapter`) and on macOS at 16K.
+
+Fault-delivery options, in order of portability: sigaction (POSIX baseline,
+implemented by both adapters) → userfaultfd (Linux refinement for when signal
+context is unavailable; maps UFFD events onto the same install protocol) →
+native kernel fault hooks. An RTOS adapter can run the single-threaded
+compressor loop exactly like the reference sim does.
 
 The reference embedder — `tests/test_core_kernel_sim.c` (`make core-sim`) — is
 the working sample: it implements fault delivery, the protection handshake,
