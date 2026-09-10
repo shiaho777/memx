@@ -1,9 +1,10 @@
 CC = clang
 CFLAGS = -O2
-CPPFLAGS = -Iinclude
+CPPFLAGS = -Iinclude -Icore
 FRAMEWORKS = -framework Metal -framework Foundation
 LIBS = -lz
 BUILD_DIR = build
+CORE_LIB = $(BUILD_DIR)/libmemx_core.a
 RUNTIME_DYLIB = $(BUILD_DIR)/libmemx_runtime.dylib
 BENCHMARK_DIR = benchmarks
 EXAMPLE_DIR = examples
@@ -23,8 +24,12 @@ all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(RUNTIME_DYLIB): libmemx3.m include/memx_runtime.h | $(BUILD_DIR)
-	$(CC) -dynamiclib $(CPPFLAGS) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $<
+$(CORE_LIB): core/memx_core.c core/memx_core.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -c -o $(BUILD_DIR)/memx_core.o core/memx_core.c
+	ar rcs $@ $(BUILD_DIR)/memx_core.o
+
+$(RUNTIME_DYLIB): libmemx3.m include/memx_runtime.h $(CORE_LIB) | $(BUILD_DIR)
+	$(CC) -dynamiclib $(CPPFLAGS) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $< $(CORE_LIB)
 
 $(EXPLICIT_TEST): tests/test_explicit_runtime.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
@@ -32,8 +37,8 @@ $(EXPLICIT_TEST): tests/test_explicit_runtime.c include/memx_runtime.h $(RUNTIME
 $(COMPRESSING_RACE_TEST): tests/test_compressing_race.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -std=c11 -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
 
-$(TENSOR_CODEC_TEST): tests/test_tensor_codecs.m libmemx3.m include/memx_runtime.h | $(BUILD_DIR)
-	MEMX_NO_SELFTEST=1 $(CC) $(CFLAGS) $(CPPFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $<
+$(TENSOR_CODEC_TEST): tests/test_tensor_codecs.m libmemx3.m include/memx_runtime.h $(CORE_LIB) | $(BUILD_DIR)
+	MEMX_NO_SELFTEST=1 $(CC) $(CFLAGS) $(CPPFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ $< $(CORE_LIB)
 
 test-tensor-codecs: $(TENSOR_CODEC_TEST)
 	@$(TENSOR_CODEC_TEST)
