@@ -16,8 +16,9 @@ TENSOR_CODEC_TEST = $(BUILD_DIR)/test_tensor_codecs
 GENERIC_TEST = $(BUILD_DIR)/test_generic_engine
 EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
+STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel explicit-runtime core-test core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-audit test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -126,6 +127,9 @@ test-capsule-roundtrip: $(RUNTIME_DYLIB)
 test-capsule-segments: $(RUNTIME_DYLIB)
 	@python3 tests/test_capsule_segments.py
 
+test-store-service: $(STORED_BIN) $(RUNTIME_DYLIB)
+	@python3 tests/test_store_service.py
+
 test-python-transformer: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_transformer_lifecycle.py
 
@@ -173,5 +177,10 @@ clean:
 
 $(CAPSULE_VESSEL): tools/memx_capsule_vessel.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+$(STORED_BIN): tools/memx_stored.c include/memx_runtime.h $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+stored: $(STORED_BIN)
 
 capsule-vessel: $(CAPSULE_VESSEL)

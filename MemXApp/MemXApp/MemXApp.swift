@@ -1,4 +1,5 @@
 import SwiftUI
+import Darwin
 
 struct CapsuleSegment: Identifiable {
     let id = UUID()
@@ -55,7 +56,10 @@ class AppState: ObservableObject {
     @Published var outputLog: [LogEntry] = []
     @Published var activeProcesses: [ActiveProcess] = []
     @Published var capsule = CapsuleInfo()
+    @Published var storeRunning = false
+    @Published var storeStats = ""
     private var monitorTimer: Timer?
+    private var storedProcess: Process?
     private var lastObservedPIDs: Set<Int32> = []
     private var lastLivePids: Set<Int32> = []
     private var didLogInitialState = false
@@ -146,6 +150,7 @@ class AppState: ObservableObject {
         }
         scanGlobalStats()
         scanActiveProcesses()
+        storeProbe()
         lastRefreshAt = Date()
         recordMonitorActivity(trigger: trigger)
     }
@@ -390,6 +395,112 @@ class AppState: ObservableObject {
         capsule.verifyDetail = pages.isEmpty ? "" : "\(bad)/\(pages) pages failed CRC"
     }
 
+    // MARK: - Store Service
+
+    private var storeSockPath: String {
+        let root = NSHomeDirectory() + "/Library/Application Support/MemX/store"
+        return root + "/store.sock"
+    }
+
+    private var bundledStoredPath: String {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/memx_stored").path
+    }
+
+    func storeStart() {
+        guard storedProcess == nil else { return }
+        let root = NSHomeDirectory() + "/Library/Application Support/MemX/store"
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bundledStoredPath)
+        p.arguments = ["--root", root]
+        p.standardError = Pipe()
+        do {
+            try p.run()
+            storedProcess = p
+            storeRunning = true
+            log("store service started pid=\(p.processIdentifier)", category: .success)
+        } catch {
+            log("store start failed: \(error.localizedDescription)", category: .error)
+        }
+    }
+
+    func storeStop() {
+        if let p = storedProcess, p.isRunning {
+            p.terminate()
+            storedProcess = nil
+            storeRunning = false
+            log("store service stopped", category: .info)
+        }
+    }
+
+    func storeProbe() {
+        guard FileManager.default.fileExists(atPath: storeSockPath) else {
+            storeRunning = storedProcess?.isRunning ?? false
+            storeStats = ""
+            return
+        }
+        storeRunning = true
+        let sockFd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard sockFd >= 0 else { return }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(storeSockPath.utf8)
+        withUnsafeMutableBytes(of: &addr.sun_path) { dst in
+            dst.copyBytes(from: pathBytes)
+        }
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(sockFd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else {
+            close(sockFd)
+            return
+        }
+        let cmd: [UInt8] = Array("STAT".utf8)
+        var beLen = UInt32(cmd.count).bigEndian
+        var payload = Data()
+        withUnsafeBytes(of: &beLen) { payload.append(contentsOf: $0) }
+        payload.append(contentsOf: cmd)
+        _ = payload.withUnsafeBytes { send(sockFd, $0.baseAddress, $0.count, 0) }
+        var lenBuf = [UInt8](repeating: 0, count: 4)
+        var got = 0
+        while got < 4 {
+            let n = lenBuf.withUnsafeMutableBytes { ptr in
+                recv(sockFd, ptr.baseAddress! + got, 4 - got, 0)
+            }
+            if n <= 0 { break }
+            got += n
+        }
+        if got == 4 {
+            let rlen = Int(lenBuf[0]) << 24 | Int(lenBuf[1]) << 16 | Int(lenBuf[2]) << 8 | Int(lenBuf[3])
+            if rlen > 0 && rlen < 4096 {
+                var resp = [UInt8](repeating: 0, count: rlen)
+                var got2 = 0
+                while got2 < rlen {
+                    let n = resp.withUnsafeMutableBytes { ptr in
+                        recv(sockFd, ptr.baseAddress! + got2, rlen - got2, 0)
+                    }
+                    if n <= 0 { break }
+                    got2 += n
+                }
+                if let text = String(bytes: resp.prefix(got2), encoding: .utf8) {
+                    storeStats = text.replacingOccurrences(of: "OK stats ", with: "")
+                }
+            }
+        }
+        // send QUIT to close cleanly
+        let q: [UInt8] = Array("QUIT".utf8)
+        var qbe = UInt32(q.count).bigEndian
+        var qpayload = Data()
+        withUnsafeBytes(of: &qbe) { qpayload.append(contentsOf: $0) }
+        qpayload.append(contentsOf: q)
+        _ = qpayload.withUnsafeBytes { send(sockFd, $0.baseAddress, $0.count, 0) }
+        var sink = [UInt8](repeating: 0, count: 64)
+        _ = recv(sockFd, &sink, 64, 0)
+        close(sockFd)
+    }
+
     // MARK: - Logging    
     private func recordMonitorActivity(trigger: String) {
         let currentPIDs = Set(activeProcesses.map(\.pid))
@@ -419,5 +530,9 @@ class AppState: ObservableObject {
     
     private func addLog(_ text: String, isError: Bool, category: LogEntry.LogCategory) {
         outputLog.append(LogEntry(text: text, time: Date(), isError: isError, category: category))
+    }
+
+    private func log(_ text: String, category: LogEntry.LogCategory) {
+        addLog(text, isError: category == .error, category: category)
     }
 }
