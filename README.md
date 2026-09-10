@@ -220,16 +220,20 @@ Known limitation: incompressible generic pages (e.g. random bytes) are stored ra
 ### Kernel-grade core
 
 The codec layer and page state machine live in `core/memx_core.{h,c}` — a
-freestanding, kernel-constrainable core (`make core-audit` proves the undefined
-symbols are exactly the `memcpy` family). The macOS runtime links this same
-archive, so the engine you use per-process is verifiably the kernel-grade core
-plus platform services.
+freestanding, OS-agnostic core (`make core-audit` proves the undefined symbols
+are exactly the `memcpy` family). The macOS runtime links this same archive,
+so the engine you use per-process is verifiably the kernel-grade core plus
+platform services.
 
-Embedding into a kernel you control: `core/EMBEDDING.md` is the contract —
-you provide fault delivery, page protection, serialization, memory, and the
-zlib inflate/uncompress hooks; the core provides codecs, the universal decoder,
-and the compression commit protocol. NEON paths all have scalar fallbacks
-(`MEMX_FORCE_SCALAR`), and zlib-bound encoders stay runtime-side.
+Cross-OS by design: the logical page size is a compile-time knob
+(`-DMEMX_CORE_PAGE_SZ=4096` for 4K kernels; default 16K), atomic loads go
+through a redefinable macro, SIMD is optional (`MEMX_FORCE_SCALAR`), and zlib
+is a hook. `make core-sim` proves the full embedder contract twice (16K and
+4K) via a reference embedder with zero OS services — fault delivery, the
+protection handshake, compression commit, and decompress-install against
+plain memory. That sim is the integration sample for porting to any OS;
+`core/EMBEDDING.md` is the complete porting guide (adapter architecture,
+per-OS knob matrix).
 
 Third-party kernel embedding on macOS itself is not possible (kext requires
 Apple entitlements + reduced security, contradicting the no-privileges goal);

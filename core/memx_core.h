@@ -10,7 +10,17 @@
 #define MEMX_HAS_NEON 0
 #endif
 
+#ifndef MEMX_CORE_PAGE_SZ
 #define MEMX_CORE_PAGE_SZ 16384
+#endif
+
+#ifndef MEMX_CORE_ATOMIC_LOAD_ACQ
+#if defined(__GNUC__) || defined(__clang__)
+#define MEMX_CORE_ATOMIC_LOAD_ACQ(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#else
+#define MEMX_CORE_ATOMIC_LOAD_ACQ(p) (*(p))
+#endif
+#endif
 
 #define MEMX_PAGE_NONE       0
 #define MEMX_PAGE_RESIDENT   1
