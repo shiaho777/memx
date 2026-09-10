@@ -27,6 +27,9 @@ static uint16_t fp16_weight_value(size_t index, size_t page) {
 }
 
 static uint16_t kv_value(size_t index, size_t page) {
+    if ((page & 1) == 0) {
+        return (uint16_t)(0x3000 + (page & 7) + (index & 0xFF));
+    }
     uint16_t base = (uint16_t)(0x3000 + (page & 7));
     return (uint16_t)(base ^ ((index / 64) & 15) ^ ((index * 13 + page) & 0x003F));
 }
