@@ -37,10 +37,29 @@ typedef struct {
     int live;
 } seg_slot_t;
 
+typedef struct {
+    char name[MAX_SEGMENT_NAME];
+    pid_t pid;
+    int conn_fd;
+    uint64_t compressed_pages;
+    uint64_t resident_pages;
+    uint64_t saved_bytes;
+    uint64_t beats;
+    time_t last_beat;
+    int live;
+} client_slot_t;
+
+#define MAX_CLIENTS 64
+#define PRESSURE_DECAY_S 60
+
 static seg_slot_t g_segs[MAX_SEGMENTS];
+static client_slot_t g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_segs_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_clients_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_running = 1;
 static volatile int g_live = 0;
+static volatile unsigned g_pressure_level = 0;
+static volatile time_t g_pressure_ts = 0;
 static char g_store_root[1024];
 static char g_sock_path[1024];
 
@@ -63,11 +82,17 @@ static void on_signal(int sig) {
     g_running = 0;
 }
 
+static unsigned pressure_level_now(void);
+
 #ifdef __APPLE__
 static void on_pressure(void *ctx) {
     dispatch_source_t src = (dispatch_source_t)ctx;
     unsigned long lvl = dispatch_source_get_data(src);
-    logf("memory pressure event level=0x%lx", lvl);
+    unsigned level = 1;
+    if (lvl & DISPATCH_MEMORYPRESSURE_CRITICAL) level = 2;
+    g_pressure_level = level;
+    g_pressure_ts = time(NULL);
+    logf("memory pressure event raw=0x%lx level=%u", lvl, level);
 }
 
 static void install_pressure_source(void) {
@@ -475,10 +500,159 @@ static int do_stats(uint8_t **reply, uint32_t *reply_len) {
         count++;
     }
     pthread_mutex_unlock(&g_segs_mu);
-    n = snprintf(buf, sizeof(buf), "OK stats segments=%d bytes=%" PRIu64 " root=%s", count, total, g_store_root);
+    pthread_mutex_lock(&g_clients_mu);
+    int nclients = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) if (g_clients[i].live) nclients++;
+    pthread_mutex_unlock(&g_clients_mu);
+    n = snprintf(buf, sizeof(buf), "OK stats segments=%d bytes=%" PRIu64 " clients=%d level=%u root=%s",
+                 count, total, nclients, pressure_level_now(), g_store_root);
     (void)n;
     *reply = (uint8_t *)strdup(buf);
     *reply_len = (uint32_t)strlen(buf);
+    return 0;
+}
+
+static unsigned pressure_level_now(void) {
+    unsigned lvl = g_pressure_level;
+    if (lvl && time(NULL) - g_pressure_ts > PRESSURE_DECAY_S) {
+        g_pressure_level = 0;
+        lvl = 0;
+    }
+    return lvl;
+}
+
+static pid_t peer_pid(int fd) {
+    pid_t pid = 0;
+    socklen_t len = (socklen_t)sizeof(pid);
+    if (getsockopt(fd, 0, LOCAL_PEERPID, &pid, &len) != 0) return 0;
+    return pid;
+}
+
+static client_slot_t *client_for_pid_locked(pid_t pid, int create) {
+    int free_idx = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].live && g_clients[i].pid == pid) return &g_clients[i];
+        if (!g_clients[i].live && free_idx < 0) free_idx = i;
+    }
+    if (!create || free_idx < 0) return NULL;
+    memset(&g_clients[free_idx], 0, sizeof(g_clients[free_idx]));
+    g_clients[free_idx].pid = pid;
+    g_clients[free_idx].live = 1;
+    return &g_clients[free_idx];
+}
+
+static int do_regs(int fd, const uint8_t *body, uint32_t len, uint8_t **reply, uint32_t *reply_len) {
+    if (len < 1 || len >= MAX_SEGMENT_NAME) {
+        *reply = (uint8_t *)strdup("ERR bad_request");
+        *reply_len = (uint32_t)strlen((char *)*reply);
+        return 0;
+    }
+    char name[MAX_SEGMENT_NAME];
+    memcpy(name, body, len);
+    name[len] = 0;
+    pid_t pid = peer_pid(fd);
+    pthread_mutex_lock(&g_clients_mu);
+    client_slot_t *c = client_for_pid_locked(pid, 1);
+    if (c) {
+        memcpy(c->name, name, len + 1);
+        c->conn_fd = fd;
+        c->last_beat = time(NULL);
+    }
+    pthread_mutex_unlock(&g_clients_mu);
+    if (!c) {
+        *reply = (uint8_t *)strdup("ERR full");
+        *reply_len = 8;
+        return 0;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "OK regs pid=%d name=%s", (int)pid, name);
+    *reply = (uint8_t *)strdup(msg);
+    *reply_len = (uint32_t)strlen(msg);
+    logf("client registered pid=%d name=%s", (int)pid, name);
+    return 0;
+}
+
+static int do_beat(int fd, const uint8_t *body, uint32_t len, uint8_t **reply, uint32_t *reply_len) {
+    if (len < 1 || len > 128) {
+        *reply = (uint8_t *)strdup("ERR bad_request");
+        *reply_len = (uint32_t)strlen((char *)*reply);
+        return 0;
+    }
+    char buf[129];
+    memcpy(buf, body, len);
+    buf[len] = 0;
+    unsigned long long cp = 0, rp = 0, sv = 0;
+    sscanf(buf, "%llu %llu %llu", &cp, &rp, &sv);
+    pid_t pid = peer_pid(fd);
+    pthread_mutex_lock(&g_clients_mu);
+    client_slot_t *c = client_for_pid_locked(pid, 1);
+    if (c) {
+        c->conn_fd = fd;
+        c->compressed_pages = cp;
+        c->resident_pages = rp;
+        c->saved_bytes = sv;
+        c->beats++;
+        c->last_beat = time(NULL);
+    }
+    pthread_mutex_unlock(&g_clients_mu);
+    *reply = (uint8_t *)strdup(c ? "OK beat" : "ERR full");
+    *reply_len = (uint32_t)strlen((char *)*reply);
+    return 0;
+}
+
+static int do_poli(uint8_t **reply, uint32_t *reply_len) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "OK POLI level=%u", pressure_level_now());
+    *reply = (uint8_t *)strdup(msg);
+    *reply_len = (uint32_t)strlen(msg);
+    return 0;
+}
+
+static int do_clnt(uint8_t **reply, uint32_t *reply_len) {
+    char buf[8192];
+    size_t off = 0;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_clients_mu);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!g_clients[i].live) continue;
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                "%s %d %llu %lld %llu %llu %llu\n",
+                                g_clients[i].name[0] ? g_clients[i].name : "-",
+                                (int)g_clients[i].pid,
+                                (unsigned long long)g_clients[i].beats,
+                                (long long)(now - g_clients[i].last_beat),
+                                (unsigned long long)g_clients[i].compressed_pages,
+                                (unsigned long long)g_clients[i].resident_pages,
+                                (unsigned long long)g_clients[i].saved_bytes);
+        if (off >= sizeof(buf) - 128) break;
+    }
+    pthread_mutex_unlock(&g_clients_mu);
+    if (off == 0) off += (size_t)snprintf(buf, sizeof(buf), "(empty)\n");
+    *reply = (uint8_t *)malloc(off + 1);
+    if (!*reply) return -1;
+    memcpy(*reply, buf, off + 1);
+    *reply_len = (uint32_t)off;
+    return 0;
+}
+
+static int do_pres(const uint8_t *body, uint32_t len, uint8_t **reply, uint32_t *reply_len) {
+    const char *dbg = getenv("MEMX_STORE_DEBUG");
+    if (!dbg || dbg[0] != '1') {
+        *reply = (uint8_t *)strdup("ERR disabled");
+        *reply_len = 12;
+        return 0;
+    }
+    if (len != 1 || body[0] < '0' || body[0] > '2') {
+        *reply = (uint8_t *)strdup("ERR bad_level");
+        *reply_len = 13;
+        return 0;
+    }
+    g_pressure_level = (unsigned)(body[0] - '0');
+    g_pressure_ts = time(NULL);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "OK pres level=%u", g_pressure_level);
+    *reply = (uint8_t *)strdup(msg);
+    *reply_len = (uint32_t)strlen(msg);
     return 0;
 }
 
@@ -507,6 +681,16 @@ static void *conn_main(void *arg) {
             (void)do_commit(&reply, &reply_len);
         } else if (len >= 5 && memcmp(frame, "VERIY", 5) == 0) {
             (void)do_verify(frame + 5, len - 5, &reply, &reply_len);
+        } else if (len >= 5 && memcmp(frame, "REGS ", 5) == 0) {
+            (void)do_regs(fd, frame + 5, len - 5, &reply, &reply_len);
+        } else if (len >= 5 && memcmp(frame, "BEAT ", 5) == 0) {
+            (void)do_beat(fd, frame + 5, len - 5, &reply, &reply_len);
+        } else if (len == 4 && memcmp(frame, "POLI", 4) == 0) {
+            (void)do_poli(&reply, &reply_len);
+        } else if (len == 4 && memcmp(frame, "CLNT", 4) == 0) {
+            (void)do_clnt(&reply, &reply_len);
+        } else if (len >= 5 && memcmp(frame, "PRES ", 5) == 0) {
+            (void)do_pres(frame + 5, len - 5, &reply, &reply_len);
         } else if (len == 4 && memcmp(frame, "STAT", 4) == 0) {
             (void)do_stats(&reply, &reply_len);
         } else if (len == 4 && memcmp(frame, "QUIT", 4) == 0) {
@@ -527,6 +711,14 @@ static void *conn_main(void *arg) {
         if (close_conn) break;
     }
     close(fd);
+    pthread_mutex_lock(&g_clients_mu);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].live && g_clients[i].conn_fd == fd) {
+            logf("client gone pid=%d name=%s", (int)g_clients[i].pid, g_clients[i].name);
+            g_clients[i].live = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_clients_mu);
     __sync_sub_and_fetch(&g_live, 1);
     return NULL;
 }
