@@ -16,6 +16,9 @@
 #endif
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
 #include <sys/sysctl.h>
 #include <pthread.h>
 #include <time.h>
@@ -5887,6 +5890,10 @@ static void *memx_realloc_internal(void *ptr, size_t size, uintptr_t requested_o
 
 // ─── Init ───
 
+static void *service_client(void *arg);
+static pthread_t g_svc_thread;
+static volatile int g_svc_enabled = 0;
+
 static int memx_pthread_spawn(pthread_t *th, void *(*fn)(void *), void *arg) {
     pthread_attr_t attr;
     int rc;
@@ -6159,7 +6166,16 @@ static void init_memx(void) {
         g_z->async_seal_running = 0;
     }
     shared_stats_init(g_z);
-    
+
+    {
+        const char *es = getenv("MEMX_SERVICE");
+        if (es && es[0] && es[0] != '0') {
+            g_svc_enabled = 1;
+            if (memx_pthread_spawn(&g_svc_thread, service_client, g_z) != 0)
+                g_svc_enabled = 0;
+        }
+    }
+
     fprintf(stderr, "[memx] ✅ memory expansion active (%llu MB virtual, %s, metal=lazy)\n",
             (unsigned long long)(g_z->vmem_size / MB), memx_mode_label());
     in_memx = 0;  // Allow this thread to use our pool
@@ -6208,6 +6224,10 @@ static void fini_memx(void) {
             pthread_join(g_z->async_pf_threads[wi], NULL);
     }
     pthread_join(g_z->bg_thread, NULL);
+    if (g_svc_enabled) {
+        pthread_join(g_svc_thread, NULL);
+        g_svc_enabled = 0;
+    }
     pthread_mutex_destroy(&g_z->async_pf_mutex);
     pthread_cond_destroy(&g_z->async_pf_cond);
     if (g_z->async_pf_q) munmap(g_z->async_pf_q, ASYNC_PF_Q_SIZE * 4);
@@ -6423,6 +6443,161 @@ static int memx_munmap(void *addr, size_t length) {
         }
     }
     return munmap(addr, length);
+}
+
+/* ── service coordination client (MEMX_SERVICE) ──────────────────────
+ * Registers this process with the resident store daemon and polls for
+ * pressure directives. Never in the fault path; daemon unreachable is
+ * not an error — reconnect with backoff until shutdown.
+ */
+
+static int svc_write_full(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return -1;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int svc_read_full(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r <= 0) return -1;
+        p += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int svc_call(int fd, const char *cmd, size_t cmd_len,
+                    const void *body, uint32_t blen,
+                    uint8_t *resp, uint32_t resp_cap, uint32_t *out_len) {
+    uint32_t flen = (uint32_t)cmd_len + blen;
+    uint32_t net = htonl(flen);
+    if (svc_write_full(fd, &net, 4) != 0) return -1;
+    if (cmd_len && svc_write_full(fd, cmd, cmd_len) != 0) return -1;
+    if (blen && svc_write_full(fd, body, blen) != 0) return -1;
+    uint32_t rnet;
+    if (svc_read_full(fd, &rnet, 4) != 0) return -1;
+    uint32_t rlen = ntohl(rnet);
+    if (rlen > resp_cap) return -1;
+    if (rlen && svc_read_full(fd, resp, rlen) != 0) return -1;
+    if (out_len) *out_len = rlen;
+    return 0;
+}
+
+static int svc_connect(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        close(fd);
+        return -1;
+    }
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+static void svc_sleep_ms(MemXZone3 *s, long ms) {
+    while (ms > 0 && s->running) {
+        long step = ms > 50 ? 50 : ms;
+        struct timespec ts = {0, step * 1000000L};
+        nanosleep(&ts, NULL);
+        ms -= step;
+    }
+}
+
+static void *service_client(void *arg) {
+    MemXZone3 *s = (MemXZone3 *)arg;
+    char pathbuf[108];
+    const char *sock = getenv("MEMX_SERVICE_SOCK");
+    if (!sock || !*sock) {
+        const char *home = getenv("HOME");
+        snprintf(pathbuf, sizeof(pathbuf),
+                 "%s/Library/Application Support/MemX/store/store.sock",
+                 home ? home : "/tmp");
+        sock = pathbuf;
+    }
+    long beat_ms = 5000;
+    const char *bm = getenv("MEMX_SERVICE_BEAT_MS");
+    if (bm) {
+        long v = strtol(bm, NULL, 10);
+        if (v >= 100) beat_ms = v;
+    }
+    char name[64];
+    const char *sn = getenv("MEMX_SERVICE_NAME");
+    snprintf(name, sizeof(name), "%s", (sn && *sn) ? sn : getprogname());
+
+    int fd = -1;
+    int registered = 0;
+    int quiet = 0;
+    uint8_t resp[256];
+    while (s->running && g_z == s) {
+        if (fd < 0) {
+            fd = svc_connect(sock);
+            if (fd < 0) {
+                if (!quiet) {
+                    fprintf(stderr, "[memx] service: %s unreachable, retrying\n", sock);
+                    quiet = 1;
+                }
+                svc_sleep_ms(s, 5000);
+                continue;
+            }
+            registered = 0;
+            quiet = 0;
+        }
+        uint32_t rlen = 0;
+        if (!registered) {
+            if (svc_call(fd, "REGS ", 5, name, (uint32_t)strlen(name),
+                         resp, sizeof(resp), &rlen) != 0) goto reopen;
+            registered = 1;
+        }
+        {
+            memx_runtime_stats_t st;
+            char body[96];
+            if (memx_runtime_get_stats(&st) == 0) {
+                snprintf(body, sizeof(body), "%llu %llu %llu",
+                         (unsigned long long)st.compressed_pages,
+                         (unsigned long long)st.resident_pages,
+                         (unsigned long long)st.bytes_saved);
+            } else {
+                snprintf(body, sizeof(body), "0 0 0");
+            }
+            if (svc_call(fd, "BEAT ", 5, body, (uint32_t)strlen(body),
+                         resp, sizeof(resp), &rlen) != 0) goto reopen;
+        }
+        {
+            rlen = 0;
+            if (svc_call(fd, "POLI", 4, NULL, 0, resp, sizeof(resp), &rlen) != 0) goto reopen;
+            resp[rlen < sizeof(resp) ? rlen : sizeof(resp) - 1] = 0;
+            unsigned level = 0;
+            const char *lp = strstr((char *)resp, "level=");
+            if (lp) level = (unsigned)strtoul(lp + 6, NULL, 10);
+            uint64_t reclaimed = 0;
+            if (level >= 2) {
+                (void)memx_runtime_trim(512u | 32u, &reclaimed);
+            } else if (level >= 1) {
+                (void)memx_runtime_trim(32u, &reclaimed);
+            }
+        }
+        svc_sleep_ms(s, beat_ms);
+        continue;
+    reopen:
+        close(fd);
+        fd = -1;
+        registered = 0;
+    }
+    if (fd >= 0) close(fd);
+    return NULL;
 }
 
 int memx_runtime_init(void) {

@@ -132,3 +132,52 @@ class Store:
         if not text.startswith("OK"):
             raise StoreError(text)
         return text
+
+    def register(self, name):
+        if not name or len(name) >= 64:
+            raise StoreError("name must be 1..63 bytes")
+        resp = self._frame(b"REGS " + name.encode())
+        text = resp.decode("utf-8", "replace")
+        if not text.startswith("OK"):
+            raise StoreError(text)
+        return text
+
+    def beat(self, compressed_pages=0, resident_pages=0, saved_bytes=0):
+        body = f"{compressed_pages} {resident_pages} {saved_bytes}".encode()
+        resp = self._frame(b"BEAT " + body)
+        text = resp.decode("utf-8", "replace")
+        if not text.startswith("OK"):
+            raise StoreError(text)
+        return text
+
+    def poli(self):
+        resp = self._frame(b"POLI")
+        text = resp.decode("utf-8", "replace")
+        if not text.startswith("OK"):
+            raise StoreError(text)
+        level = 0
+        for part in text.split():
+            if part.startswith("level="):
+                level = int(part.split("=", 1)[1])
+        return level
+
+    def clients(self):
+        resp = self._frame(b"CLNT")
+        text = resp.decode("utf-8", "replace")
+        if text.strip() == "(empty)":
+            return []
+        rows = []
+        for line in text.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 7:
+                rows.append((parts[0], int(parts[1]), int(parts[2]),
+                             int(parts[3]), int(parts[4]), int(parts[5]),
+                             int(parts[6])))
+        return rows
+
+    def pres(self, level):
+        resp = self._frame(b"PRES " + str(int(level)).encode())
+        text = resp.decode("utf-8", "replace")
+        if not text.startswith("OK"):
+            raise StoreError(text)
+        return text

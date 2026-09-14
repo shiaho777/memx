@@ -72,6 +72,16 @@ def gen_dirs(store_root):
     return sorted(p.name for p in Path(store_root).glob("gen-*") if p.is_dir())
 
 
+E2E_SCRIPT = (
+    "import sys, time; sys.path.insert(0, 'python')\n"
+    "import memx_runtime as memx\n"
+    "rt = memx.Runtime('build/libmemx_runtime.dylib')\n"
+    "ctx = rt.create_context('svc-e2e')\n"
+    "time.sleep(3.0)\n"
+    "rt.shutdown()\n"
+)
+
+
 def main():
     vessel = ROOT / "build" / "memx_stored"
     if not vessel.exists():
@@ -84,6 +94,7 @@ def main():
         env = dict(os.environ)
         env["MEMX_NO_SELFTEST"] = "1"
         env["MEMX_STORE_KEEP_GENS"] = "2"
+        env["MEMX_STORE_DEBUG"] = "1"
         proc = start_server(vessel, sock, store_root, env)
         try:
 
@@ -146,6 +157,52 @@ def main():
             # Concurrency gate: parallel clients on separate connections.
             concurrent_clients(sock)
 
+            # Coordination gate: register/beat/poli/clnt + debug pressure.
+            with memx_store.Store(sock) as st:
+                st.register("gate")
+                st.beat(10, 20, 30)
+                assert st.poli() == 0
+                cl = st.clients()
+                assert any(c[0] == "gate" and c[1] == os.getpid() for c in cl), cl
+                st.pres(2)
+                assert st.poli() == 2
+                st.pres(0)
+                assert st.poli() == 0
+                smsg = st.stats()
+                assert "clients=" in smsg and "level=" in smsg, smsg
+
+            # E2E gate: a runtime subprocess with MEMX_SERVICE=1 registers,
+            # beats, and clears on exit.
+            e2e_env = dict(env)
+            e2e_env["MEMX_SERVICE"] = "1"
+            e2e_env["MEMX_SERVICE_SOCK"] = sock
+            e2e_env["MEMX_SERVICE_NAME"] = "rt-e2e"
+            e2e_env["MEMX_SERVICE_BEAT_MS"] = "150"
+            e2e = subprocess.Popen(
+                [sys.executable, "-c", E2E_SCRIPT],
+                env=e2e_env, cwd=str(ROOT),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            deadline = time.time() + 15
+            seen = False
+            while time.time() < deadline and not seen:
+                with memx_store.Store(sock) as st:
+                    cl = st.clients()
+                seen = any(c[0] == "rt-e2e" and c[1] == e2e.pid and c[2] >= 1 for c in cl)
+                if not seen:
+                    time.sleep(0.15)
+            assert seen, "runtime client never registered/beat"
+            e2e.wait(timeout=15)
+            deadline = time.time() + 10
+            cleared = False
+            while time.time() < deadline and not cleared:
+                with memx_store.Store(sock) as st:
+                    cl = st.clients()
+                cleared = not any(c[1] == e2e.pid for c in cl)
+                if not cleared:
+                    time.sleep(0.15)
+            assert cleared, "client entry not cleared on disconnect"
+
             # Residency gate: generation numbers continue across a restart.
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=10)
@@ -161,7 +218,7 @@ def main():
                 v4 = st.verify(gen4)
                 assert v4.startswith("OK verify bad=0"), v4
 
-            print(f"OK store service {gen}->{gen4} put/get/list/drop/commit/verify/concurrent/gc bitexact")
+            print(f"OK store service {gen}->{gen4} put/get/list/drop/commit/verify/concurrent/gc/coord bitexact")
             return 0
         finally:
             proc.send_signal(signal.SIGTERM)
