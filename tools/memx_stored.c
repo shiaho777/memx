@@ -1,11 +1,13 @@
 #include "memx_runtime.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,12 +15,19 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 
 #define PAGE_SZ 16384ull
 #define MAX_SEGMENT_NAME 64
 #define MAX_SEGMENTS 128
 #define MAX_PAYLOAD (256ull * 1024 * 1024)
+#define MAX_GENS 4096
+#define SHUTDOWN_DRAIN_MS 3000
 
 typedef struct {
     char name[MAX_SEGMENT_NAME];
@@ -31,13 +40,49 @@ typedef struct {
 static seg_slot_t g_segs[MAX_SEGMENTS];
 static pthread_mutex_t g_segs_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_running = 1;
+static volatile int g_live = 0;
 static char g_store_root[1024];
 static char g_sock_path[1024];
+
+static void logf(const char *fmt, ...) {
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[%s] ", ts);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
 
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
 }
+
+#ifdef __APPLE__
+static void on_pressure(void *ctx) {
+    dispatch_source_t src = (dispatch_source_t)ctx;
+    unsigned long lvl = dispatch_source_get_data(src);
+    logf("memory pressure event level=0x%lx", lvl);
+}
+
+static void install_pressure_source(void) {
+    dispatch_source_t src = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (!src) return;
+    dispatch_set_context(src, src);
+    dispatch_source_set_event_handler_f(src, on_pressure);
+    dispatch_resume(src);
+}
+#else
+static void install_pressure_source(void) {}
+#endif
 
 static void mkdir_p(const char *path) {
     char tmp[1024];
@@ -239,6 +284,84 @@ static int do_drop(const uint8_t *body, uint32_t len, uint8_t **reply, uint32_t 
     return 0;
 }
 
+static uint32_t parse_gen(const char *name) {
+    if (strncmp(name, "gen-", 4) != 0) return 0;
+    const char *p = name + 4;
+    uint32_t v = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint32_t)(*p - '0');
+        p++;
+        digits++;
+    }
+    if (*p != 0 || digits == 0) return 0;
+    return v;
+}
+
+static uint32_t scan_max_gen(void) {
+    uint32_t max = 0;
+    DIR *d = opendir(g_store_root);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint32_t g = parse_gen(e->d_name);
+        if (g > max) max = g;
+    }
+    closedir(d);
+    return max;
+}
+
+static int rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char child[1152];
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            (void)rm_rf(child);
+        }
+        closedir(d);
+        return rmdir(path);
+    }
+    return unlink(path);
+}
+
+static int gen_cmp_desc(const void *a, const void *b) {
+    uint32_t ga = *(const uint32_t *)a, gb = *(const uint32_t *)b;
+    return (ga < gb) - (ga > gb);
+}
+
+static void gc_generations(void) {
+    long keep = 8;
+    const char *env = getenv("MEMX_STORE_KEEP_GENS");
+    if (env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 0) keep = v;
+    }
+    if (keep == 0) return;
+    uint32_t gens[MAX_GENS];
+    size_t n = 0;
+    DIR *d = opendir(g_store_root);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < MAX_GENS) {
+        uint32_t g = parse_gen(e->d_name);
+        if (g) gens[n++] = g;
+    }
+    closedir(d);
+    if (n <= (size_t)keep) return;
+    qsort(gens, n, sizeof(uint32_t), gen_cmp_desc);
+    for (size_t i = (size_t)keep; i < n; i++) {
+        char dir[1152];
+        snprintf(dir, sizeof(dir), "%s/gen-%06u", g_store_root, gens[i]);
+        if (rm_rf(dir) == 0) logf("gc: pruned gen-%06u", gens[i]);
+    }
+}
+
 static int do_commit(uint8_t **reply, uint32_t *reply_len) {
     if (memx_runtime_init() != 0) {
         *reply = (uint8_t *)strdup("ERR init");
@@ -253,8 +376,7 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
     }
     int named = 0;
     char gen_dir[1152];
-    static uint32_t gen_counter = 0;
-    uint32_t gen = ++gen_counter;
+    uint32_t gen = scan_max_gen() + 1;
     snprintf(gen_dir, sizeof(gen_dir), "%s/gen-%06u", g_store_root, gen);
     mkdir_p(gen_dir);
 
@@ -296,8 +418,10 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
         memx_runtime_context_destroy(ctx);
         (void)memx_runtime_capsule_detach();
         memx_runtime_shutdown();
+        (void)rm_rf(gen_dir);
         return 0;
     }
+    gc_generations();
     char msg[256];
     snprintf(msg, sizeof(msg), "OK commit gen-%06u segments=%d bytes=%" PRIu64, gen, named, bytes);
     *reply = (uint8_t *)strdup(msg);
@@ -358,7 +482,8 @@ static int do_stats(uint8_t **reply, uint32_t *reply_len) {
     return 0;
 }
 
-static void handle_conn(int fd) {
+static void *conn_main(void *arg) {
+    int fd = (int)(intptr_t)arg;
     while (g_running) {
         uint32_t len = 0;
         uint8_t *frame = recv_frame(fd, &len);
@@ -402,6 +527,33 @@ static void handle_conn(int fd) {
         if (close_conn) break;
     }
     close(fd);
+    __sync_sub_and_fetch(&g_live, 1);
+    return NULL;
+}
+
+static int acquire_lock(const char *path) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
+            dprintf(fd, "%d\n", (int)getpid());
+            return fd;
+        }
+        if (errno != EEXIST) return -1;
+        int rfd = open(path, O_RDONLY);
+        if (rfd < 0) {
+            if (unlink(path) == 0) continue;
+            return -1;
+        }
+        char buf[64] = {0};
+        (void)read(rfd, buf, sizeof(buf) - 1);
+        close(rfd);
+        long pid = strtol(buf, NULL, 10);
+        if (pid > 0 && kill((pid_t)pid, 0) == 0) return -1;
+        if (pid > 0 && errno == EPERM) return -1;
+        if (unlink(path) != 0) return -1;
+        logf("reclaimed stale lock pid=%ld", pid);
+    }
+    return -1;
 }
 
 int main(int argc, char **argv) {
@@ -450,14 +602,14 @@ int main(int argc, char **argv) {
 
     char lock_path[1100];
     snprintf(lock_path, sizeof(lock_path), "%s/store.lock", g_store_root);
-    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_EXCL, 0644);
+    int lock_fd = acquire_lock(lock_path);
     if (lock_fd < 0) {
-        fprintf(stderr, "[memx_stored] another instance holds %s\n", lock_path);
+        logf("another instance holds %s", lock_path);
         return 1;
     }
-    dprintf(lock_fd, "%d\n", (int)getpid());
 
-    fprintf(stderr, "[memx_stored] listening %s root=%s\n", g_sock_path, g_store_root);
+    install_pressure_source();
+    logf("listening %s root=%s", g_sock_path, g_store_root);
 
     while (g_running) {
         fd_set rfds;
@@ -469,11 +621,36 @@ int main(int argc, char **argv) {
         if (!FD_ISSET(lfd, &rfds)) continue;
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) continue;
-        handle_conn(cfd);
+        uid_t euid = (uid_t)-1;
+        gid_t egid = (gid_t)-1;
+        if (getpeereid(cfd, &euid, &egid) != 0 || euid != getuid()) {
+            logf("refused peer uid=%d", (int)euid);
+            close(cfd);
+            continue;
+        }
+        __sync_add_and_fetch(&g_live, 1);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8u << 20);
+        pthread_t thr;
+        int prc = pthread_create(&thr, &attr, conn_main, (void *)(intptr_t)cfd);
+        pthread_attr_destroy(&attr);
+        if (prc != 0) {
+            __sync_sub_and_fetch(&g_live, 1);
+            close(cfd);
+            continue;
+        }
+        pthread_detach(thr);
     }
 
+    for (int i = 0; i < SHUTDOWN_DRAIN_MS / 10 && g_live > 0; i++) {
+        struct timespec ts = {0, 10000000L};
+        nanosleep(&ts, NULL);
+    }
+    close(lfd);
+    close(lock_fd);
     unlink(g_sock_path);
     unlink(lock_path);
-    fprintf(stderr, "[memx_stored] bye\n");
+    logf("bye live=%d", g_live);
     return 0;
 }

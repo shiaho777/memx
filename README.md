@@ -272,7 +272,9 @@ cp build/memx_stored /usr/local/bin/        # optional, for the plist
 launchctl load ~/Library/LaunchAgents/com.memx.stored.plist  # after installing tools/com.memx.stored.plist
 ```
 
-- Socket: `~/Library/Application Support/MemX/store/store.sock` (0600), single-instance lock file, `SIGTERM`-clean.
+- Socket: `~/Library/Application Support/MemX/store/store.sock` (0600 + `getpeereid` check), single-instance lock file with stale-pid reclaim (safe under `KeepAlive` restart), `SIGTERM`-clean with bounded connection drain.
+- Residency: the shipped plist runs `RunAtLoad` + `KeepAlive{SuccessfulExit=false}` — the daemon restarts after a crash but stays down on a clean `QUIT`. Connections are served on detached worker threads; a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` subscription logs system pressure events.
+- Generations: `COMIT` exports `store/gen-NNNNNN` with numbers continuing monotonically across daemon restarts. `MEMX_STORE_KEEP_GENS` (default 8, `0` = keep all) prunes older generations after each commit; failed commits leave no partial gen dir.
 - Protocol (length-prefixed frames over UDS): `PUT <name> <page-aligned bytes>` (buffered in the service), `GET <name>` (bitexact), `LIST`, `DROP <name>`, `COMIT` (host engine compresses all segments and exports an immutable capsule generation `store/gen-NNNNNN` with manifest), `VERIY <gen>` (full CRC verify), `STAT`, `QUIT`.
 - Python SDK: `python/memx_store.py` — `Store(sock).put/get/list/drop/commit/verify/stats` (context-manager).
 - Update = new generation dir (APFS clone keeps unchanged pages cheap); concurrency = many readers / one writer by convention.
