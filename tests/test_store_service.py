@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +36,42 @@ def wait_socket(path, timeout=15.0):
     return False
 
 
+def start_server(vessel, sock, store_root, env):
+    proc = subprocess.Popen(
+        [str(vessel), "--sock", sock, "--root", store_root],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert wait_socket(sock), "server never came up"
+    return proc
+
+
+def concurrent_clients(sock, nclients=4, rounds=3):
+    errors = []
+
+    def worker(idx):
+        page = bytes((idx * 64 + (i * 13 + 5)) & 0xFF for i in range(16384))
+        blob = page * 4
+        name = f"thr{idx}"
+        try:
+            with memx_store.Store(sock) as st:
+                for _ in range(rounds):
+                    st.put(name, blob)
+                    assert st.get(name) == blob, f"{name} not bitexact"
+        except Exception as e:
+            errors.append(f"thr{idx}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(nclients)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"concurrent clients failed: {errors}"
+
+
+def gen_dirs(store_root):
+    return sorted(p.name for p in Path(store_root).glob("gen-*") if p.is_dir())
+
+
 def main():
     vessel = ROOT / "build" / "memx_stored"
     if not vessel.exists():
@@ -46,12 +83,9 @@ def main():
         store_root = os.path.join(td, "store")
         env = dict(os.environ)
         env["MEMX_NO_SELFTEST"] = "1"
-        proc = subprocess.Popen(
-            [str(vessel), "--sock", sock, "--root", store_root],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        env["MEMX_STORE_KEEP_GENS"] = "2"
+        proc = start_server(vessel, sock, store_root, env)
         try:
-            assert wait_socket(sock), "server never came up"
 
             page = bytes((i * 31 + 7) & 0xFF for i in range(16384))
             rows = page * 24
@@ -100,7 +134,34 @@ def main():
             rt.capsule_detach()
             rt.shutdown()
 
-            print(f"OK store service {gen} put/get/list/drop/commit/verify bitexact")
+            # GC gate: KEEP_GENS=2, third commit prunes the oldest generation.
+            with memx_store.Store(sock) as st:
+                st.commit()
+                c3 = st.commit()
+                assert c3.startswith("OK commit gen-"), c3
+                gens = gen_dirs(store_root)
+                assert len(gens) == 2, f"expected 2 gen dirs, got {gens}"
+                assert gens[-1] == c3.split()[2], f"newest gen missing: {gens}"
+
+            # Concurrency gate: parallel clients on separate connections.
+            concurrent_clients(sock)
+
+            # Residency gate: generation numbers continue across a restart.
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+            proc = start_server(vessel, sock, store_root, env)
+            with memx_store.Store(sock) as st:
+                st.put("rows", rows)
+                c4 = st.commit()
+                assert c4.startswith("OK commit gen-"), c4
+                gen4 = c4.split()[2]
+                prev = int(gens[-1].split("-")[1])
+                assert int(gen4.split("-")[1]) == prev + 1, \
+                    f"generation did not continue across restart: {gen4} after {gens[-1]}"
+                v4 = st.verify(gen4)
+                assert v4.startswith("OK verify bad=0"), v4
+
+            print(f"OK store service {gen}->{gen4} put/get/list/drop/commit/verify/concurrent/gc bitexact")
             return 0
         finally:
             proc.send_signal(signal.SIGTERM)
