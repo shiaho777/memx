@@ -18,7 +18,7 @@ EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare test-extensions example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -158,6 +158,21 @@ test-capsule-roundtrip: $(RUNTIME_DYLIB)
 test-capsule-segments: $(RUNTIME_DYLIB)
 	@python3 tests/test_capsule_segments.py
 
+test-memx-array: $(RUNTIME_DYLIB)
+	@MEMX_CPU_ONLY=1 python3 tests/test_memx_array.py
+
+test-memx-kv: $(RUNTIME_DYLIB)
+	@MEMX_CPU_ONLY=1 python3 tests/test_memx_kv.py
+
+test-memx-fleet: $(RUNTIME_DYLIB)
+	@MEMX_CPU_ONLY=1 python3 tests/test_memx_fleet.py
+
+test-memx-session: $(STORED_BIN) $(RUNTIME_DYLIB)
+	@MEMX_CPU_ONLY=1 python3 tests/test_memx_session.py
+
+test-capsule-datashare: $(RUNTIME_DYLIB)
+	@MEMX_CPU_ONLY=1 python3 tests/test_capsule_datashare.py
+
 test-store-service: $(STORED_BIN) $(RUNTIME_DYLIB)
 	@python3 tests/test_store_service.py
 
@@ -171,6 +186,8 @@ test-python-torch-pressure: $(RUNTIME_DYLIB)
 	@python3 tests/test_python_torch_pressure.py
 
 test-python: test-python-runtime test-python-bitexact test-python-transformer test-python-torch-transformer test-python-torch-pressure test-capsule-roundtrip
+
+test-extensions: test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare
 
 examples: $(EMBEDDED_EXAMPLE)
 
