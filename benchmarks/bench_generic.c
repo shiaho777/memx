@@ -9,7 +9,7 @@
 
 #define MB (1024ULL * 1024ULL)
 #define PAGE_SZ 16384ULL
-#define ALLOC_BYTES (32 * MB)
+#define ALLOC_BYTES (4 * MB)
 
 typedef enum { CLASS_ZEROS, CLASS_TEXT, CLASS_STRUCT_I32, CLASS_COUNT } data_class_t;
 

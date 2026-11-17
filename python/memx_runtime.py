@@ -1074,6 +1074,8 @@ class Allocation:
         self._buffer = None
 
     def buffer(self):
+        if not self.ptr:
+            raise ValueError("allocation already freed")
         if self._buffer is None or len(self._buffer) != self.size:
             self._buffer = (ctypes.c_uint8 * self.size).from_address(self.ptr.value)
         return self._buffer
@@ -1082,6 +1084,8 @@ class Allocation:
         import torch
         import ctypes
 
+        if not self.ptr:
+            raise ValueError("allocation already freed")
         elements = 1
         for dim in shape:
             elements *= dim
@@ -1109,3 +1113,4 @@ class Allocation:
         if self.ptr:
             self.context.runtime.lib.memx_runtime_context_free(self.context.handle, self.ptr)
             self.ptr = None
+            self._buffer = None

@@ -56,6 +56,7 @@ static seg_slot_t g_segs[MAX_SEGMENTS];
 static client_slot_t g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_segs_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_clients_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_commit_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_running = 1;
 static volatile int g_live = 0;
 static volatile unsigned g_pressure_level = 0;
@@ -387,7 +388,7 @@ static void gc_generations(void) {
     }
 }
 
-static int do_commit(uint8_t **reply, uint32_t *reply_len) {
+static int do_commit_locked(uint8_t **reply, uint32_t *reply_len) {
     if (memx_runtime_init() != 0) {
         *reply = (uint8_t *)strdup("ERR init");
         *reply_len = (uint32_t)strlen((char *)*reply);
@@ -414,6 +415,8 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
     desc.flags = MEMX_TENSOR_FLAG_READ_MOSTLY | MEMX_TENSOR_FLAG_COLD;
 
     int failed = 0;
+    void *commit_ptrs[MAX_SEGMENTS];
+    int commit_n = 0;
     pthread_mutex_lock(&g_segs_mu);
     for (int i = 0; i < MAX_SEGMENTS && !failed; i++) {
         if (!g_segs[i].live) continue;
@@ -425,6 +428,7 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
         desc.stride[1] = 1;
         void *ptr = memx_runtime_context_malloc_tensor(ctx, nbytes, &desc);
         if (!ptr) { failed = 1; break; }
+        commit_ptrs[commit_n++] = ptr;
         memcpy(ptr, g_segs[i].data, nbytes);
         uint64_t done = 0;
         (void)memx_runtime_context_force_compress_range(ctx, ptr, 0, nbytes, &done);
@@ -435,6 +439,7 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
 
     uint64_t bytes = 0;
     int rc = failed ? -1 : memx_runtime_capsule_export(gen_dir, &bytes);
+    for (int i = 0; i < commit_n; i++) memx_runtime_context_free(ctx, commit_ptrs[i]);
     if (rc != 0 || named == 0) {
         char msg[160];
         snprintf(msg, sizeof(msg), "ERR commit rc=%d named=%d", rc, named);
@@ -455,6 +460,13 @@ static int do_commit(uint8_t **reply, uint32_t *reply_len) {
     (void)memx_runtime_capsule_detach();
     memx_runtime_shutdown();
     return 0;
+}
+
+static int do_commit(uint8_t **reply, uint32_t *reply_len) {
+    pthread_mutex_lock(&g_commit_mu);
+    int rc = do_commit_locked(reply, reply_len);
+    pthread_mutex_unlock(&g_commit_mu);
+    return rc;
 }
 
 static int do_verify(const uint8_t *body, uint32_t len, uint8_t **reply, uint32_t *reply_len) {

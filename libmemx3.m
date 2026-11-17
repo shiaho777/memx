@@ -4799,10 +4799,8 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         if (try_fp16 &&
             (role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING || coldish ||
              role == MEMX_TENSOR_ROLE_KV_CACHE)) {
-            if (!zsplit_done) {
-                zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
-                zsplit_done = 1;
-            }
+            zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
+            zsplit_done = 1;
             if (zsplit_csz > 0 && (best_csz == 0 || zsplit_csz < best_csz)) {
                 best_csz = zsplit_csz;
                 best_codec = MEMX_CODEC_TENSOR_FP16_ZLIB_SPLIT;
@@ -4850,10 +4848,8 @@ static void encode_tensor_page_one(MemXZone3 *s, size_t pidx, const uint8_t *src
         if (best_csz > 0) {
             if ((role == MEMX_TENSOR_ROLE_WEIGHT || role == MEMX_TENSOR_ROLE_EMBEDDING) &&
                 best_codec == MEMX_CODEC_TENSOR_EXP_PACK) {
-                if (!zsplit_done) {
-                    zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
-                    zsplit_done = 1;
-                }
+                zsplit_csz = tensor_fp16_zlib_split_compress(src, codec_tmp, PAGE_SZ);
+                zsplit_done = 1;
                 if (zsplit_csz > 0 && zsplit_csz <= (best_csz + (best_csz / 8) + 64)) {
                     best_csz = zsplit_csz;
                     best_codec = MEMX_CODEC_TENSOR_FP16_ZLIB_SPLIT;
@@ -5073,6 +5069,13 @@ static void *bg_compressor(void *arg) {
             if(s->meta[pi].state==PAGE_RESIDENT) {
                 if (s->meta[pi].cooldown > 0) {
                     s->meta[pi].cooldown--;
+                } else if (s->meta[pi].codec_fail_streak >= 4) {
+                    unsigned shift = s->meta[pi].codec_fail_streak - 4u;
+                    unsigned backoff = shift >= 4 ? 255u : (32u << shift);
+                    if (backoff > 255u) backoff = 255u;
+                    s->meta[pi].cooldown = (uint8_t)backoff;
+                    if (new_res != i) s->res_list[new_res] = pi;
+                    new_res++;
                 } else if ((s->meta[pi].tensor_flags & (MEMX_TENSOR_FLAG_HOT | MEMX_TENSOR_FLAG_NO_COMPRESS)) == 0) {
                     int cold_pri = (s->meta[pi].tensor_flags & (MEMX_TENSOR_FLAG_COLD | MEMX_TENSOR_FLAG_READ_MOSTLY)) != 0;
                     int llm_pri =
@@ -5108,10 +5111,9 @@ static void *bg_compressor(void *arg) {
         }
         s->res_count = new_res;
         if(nc==0){
-            // Fallback: if res_list is empty but there may be untracked RESIDENT pages
-            // (e.g. pages allocated before list was populated, or list overflow)
-            // Do a bitmap-guided scan of used pages
-            {
+            // Fallback scan for untracked RESIDENT pages is only needed rarely;
+            // run it every 16th idle cycle instead of every cycle.
+            if ((s->idle_count & 15u) == 0) {
                 static size_t scan_cursor = 0;
                 size_t scanned = 0;
                 size_t limit = s->npages < 65536 ? s->npages : 65536;
@@ -5423,6 +5425,7 @@ static void *bg_compressor(void *arg) {
                     max_cs = (PAGE_SZ * 15) / 16;
                 }
                 if (cs == 0 || cs >= PAGE_SZ || cs >= max_cs) {
+                    if (s->meta[pidx].codec_fail_streak < 255) s->meta[pidx].codec_fail_streak++;
                     s->meta[pidx].cooldown = 16;
                     restore_compressing_page(s, pidx);
                     continue;
@@ -5991,9 +5994,7 @@ static void init_memx(void) {
     g_z->dedup_sz   = (uint32_t*)mmap(NULL, DEDUP_HT_SIZE*4, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     g_z->dedup_ref  = (uint32_t*)mmap(NULL, DEDUP_HT_SIZE*4, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
     g_z->dedup_pending_free = (uint8_t*)mmap(NULL, DEDUP_HT_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
-    memset(g_z->dedup_hash, 0, DEDUP_HT_SIZE*8);
-    memset(g_z->dedup_ref, 0, DEDUP_HT_SIZE*4);
-    memset(g_z->dedup_pending_free, 0, DEDUP_HT_SIZE);
+    /* anonymous mmaps are zero-filled by the kernel; commit lazily on use */
     g_z->dedup_rev = NULL;
     g_z->dedup_rev_size = 0;
     g_z->dedup_rev_mask = 0;
@@ -6069,9 +6070,18 @@ static void init_memx(void) {
     sa.sa_sigaction = fault_handler; sa.sa_flags = SA_SIGINFO|SA_NODEFER|SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, &old_segv); sigaction(SIGBUS, &sa, &old_bus);
+    const char *keep_exc = getenv("MEMX_KEEP_EXC_PORT");
+    if (!(keep_exc && keep_exc[0] == '1')) {
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS,
+                                 MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+    }
     g_z->attached = 1;
 
-    pthread_mutex_init(&g_z->alloc_mutex, NULL);
+    pthread_mutexattr_t alloc_mu_attr;
+    pthread_mutexattr_init(&alloc_mu_attr);
+    pthread_mutexattr_settype(&alloc_mu_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_z->alloc_mutex, &alloc_mu_attr);
+    pthread_mutexattr_destroy(&alloc_mu_attr);
     if (pool_vault_native_enabled()) {
         g_z->pool_vault_native = 1;
         g_z->pool_detached = 1;
@@ -6233,11 +6243,8 @@ static void fini_memx(void) {
     if (g_z->async_pf_q) munmap(g_z->async_pf_q, ASYNC_PF_Q_SIZE * 4);
     // Restore signal handlers FIRST to prevent faults during cleanup
     if (g_z->attached) { sigaction(SIGSEGV, &old_segv, NULL); sigaction(SIGBUS, &old_bus, NULL); g_z->attached = 0; }
-    if (!g_z->phoenix_sealed && g_z->meta && g_z->vmem) {
-        for (size_t i=0; i<g_z->npages; i++)
-            if (g_z->meta[i].state==PAGE_COMPRESSED||g_z->meta[i].state==PAGE_NONE)
-                mprotect((uint8_t*)g_z->vmem+i*PAGE_SZ, PAGE_SZ, PROT_READ|PROT_WRITE);
-    }
+    /* vmem is unmapped below; no per-page restore scan needed (it touched
+       every PageMeta and ballooned RSS on large-RAM machines). */
     g_z->gpu_sb = nil; g_z->gpu_db = nil; g_z->gpu_zb = nil;
     size_t batch_bytes = g_z->batch_cap * PAGE_SZ;
     if (g_z->tmp_src && g_z->tmp_src != MAP_FAILED) munmap(g_z->tmp_src, batch_bytes);
@@ -8322,7 +8329,6 @@ static void mat_cache_map_alloc(void) {
         g_mat_cache = (memx_mat_cache_ent_t *)m;
         g_mat_cache_map_bytes = bytes;
         g_mat_cache_heap = 0;
-        memset(g_mat_cache, 0, bytes);
     }
     if (g_mat_cache) {
         for (int i = 0; i < MEMX_MAT_CACHE_N; i++) {
@@ -8857,6 +8863,33 @@ int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const vo
         g_sov_batch_mode = 0;
     }
 
+    size_t npages_span = p1 - p0;
+    int par_ok = !sov_fast && npages_span >= 32 &&
+                 (offset % PAGE_SZ) == 0 && (length % PAGE_SZ) == 0 &&
+                 (flags & MEMX_MATERIALIZE_BF16_TO_FP16) == 0 &&
+                 sp + p1 <= g_z->npages;
+    if (par_ok) {
+        const char *par_env = getenv("MEMX_MAT_PAR");
+        if (par_env && par_env[0] == '0') par_ok = 0;
+    }
+    if (par_ok) {
+        __block int par_fail = 0;
+        dispatch_apply(npages_span, DISPATCH_APPLY_AUTO, ^(size_t i) {
+            if (par_fail) return;
+            size_t pidx = sp + p0 + i;
+            uint8_t *direct = out + i * PAGE_SZ;
+            if (materialize_page_bytes(g_z, pidx, direct, flags) != 0) {
+                uint8_t fb[PAGE_SZ];
+                if (materialize_page_bytes(g_z, pidx, fb, flags) != 0) {
+                    __sync_fetch_and_or(&par_fail, 1);
+                    return;
+                }
+                memcpy(direct, fb, PAGE_SZ);
+            }
+        });
+        if (!par_fail) return 0;
+    }
+
     size_t cur = offset;
     uint8_t pagebuf[PAGE_SZ];
     while (cur < end) {
@@ -8870,6 +8903,13 @@ int memx_runtime_context_materialize_range(memx_runtime_context_t *ctx, const vo
         if (sov_fast) srcp = materialize_from_sov_ptr(g_z, pidx);
         if (srcp) {
             materialize_emit(srcp + inside, out + (cur - offset), take, flags);
+        } else if (inside == 0 && take == PAGE_SZ &&
+                   (flags & MEMX_MATERIALIZE_BF16_TO_FP16) == 0) {
+            uint8_t *direct = out + (cur - offset);
+            if (materialize_page_bytes(g_z, pidx, direct, flags) != 0) {
+                if (materialize_page_bytes(g_z, pidx, pagebuf, flags) != 0) return EIO;
+                memcpy(direct, pagebuf, PAGE_SZ);
+            }
         } else {
             if (materialize_page_bytes(g_z, pidx, pagebuf, flags) != 0) return EIO;
             materialize_emit(pagebuf + inside, out + (cur - offset), take, flags);

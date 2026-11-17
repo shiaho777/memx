@@ -18,7 +18,7 @@ EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare test-extensions example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-stream-materialize test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare test-extensions example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule bench-materialize
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -158,6 +158,23 @@ test-capsule-roundtrip: $(RUNTIME_DYLIB)
 test-capsule-segments: $(RUNTIME_DYLIB)
 	@python3 tests/test_capsule_segments.py
 
+STREAM_MAT_TEST = $(BUILD_DIR)/test_stream_materialize
+
+$(STREAM_MAT_TEST): tests/test_stream_materialize.c $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+test-stream-materialize: $(STREAM_MAT_TEST)
+	@$(STREAM_MAT_TEST)
+
+BENCH_MAT = $(BUILD_DIR)/bench_materialize
+
+$(BENCH_MAT): benchmarks/bench_materialize.c $(RUNTIME_DYLIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Iinclude -L$(BUILD_DIR) -Wl,-rpath,@executable_path -o $@ $< -lmemx_runtime
+
+bench-materialize: $(BENCH_MAT)
+	@$(BENCH_MAT) c
+	@$(BENCH_MAT) i
+
 test-memx-array: $(RUNTIME_DYLIB)
 	@MEMX_CPU_ONLY=1 python3 tests/test_memx_array.py
 
@@ -218,7 +235,7 @@ benchmark-materialize: $(BUILD_DIR)/bench_materialize
 benchmark-capsule: $(BUILD_DIR)/bench_capsule
 	@$(BUILD_DIR)/bench_capsule
 
-test: test-explicit test-compressing-race test-tensor-codecs test-generic example-embedded
+test: test-explicit test-compressing-race test-tensor-codecs test-generic example-embedded test-stream-materialize
 
 clean:
 	rm -rf $(BUILD_DIR)
