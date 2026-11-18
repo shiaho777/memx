@@ -1,0 +1,42 @@
+name: Windows adapter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "platform/windows/**"
+      - "tests/test_windows_adapter.c"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "platform/windows/**"
+      - "tests/test_windows_adapter.c"
+      - ".github/workflows/windows.yml"
+
+jobs:
+  windows-core:
+    name: windows-core
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make
+
+      - name: Build core + Windows adapter test
+        run: |
+          gcc -O2 -ffreestanding -fno-builtin -DMEMX_FORCE_SCALAR -Icore -c core/memx_core.c -o memx_core.o
+          gcc -O2 -DMEMX_FORCE_SCALAR -Icore -Iplatform/windows \
+            tests/test_windows_adapter.c platform/windows/memx_windows.c memx_core.o \
+            -o test_windows_adapter.exe
+
+      - name: Run end-to-end adapter test
+        run: ./test_windows_adapter.exe
