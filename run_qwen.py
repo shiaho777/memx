@@ -751,7 +751,7 @@ class MemXHost:
             if pattern != getattr(self, "_wt_pattern", None):
                 tmpl[1::2] = bytes([pattern]) * (len(tmpl) // 2)
                 self._wt_pattern = pattern
-            ctypes.memmove(ctypes.addressof(buf) + base, tmpl, span)
+            ctypes.memmove(ctypes.addressof(buf) + base, (ctypes.c_char * span).from_buffer(tmpl), span)
         self.written_tokens = max(self.written_tokens, token_idx + 1)
         if (token_idx & 3) == 3:
             self.advance()

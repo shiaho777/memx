@@ -23,6 +23,9 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 typedef struct {
     uint8_t *region;
@@ -316,6 +319,14 @@ int memx_posix_init(size_t region_bytes, uint16_t tensor_role, uint16_t tensor_d
         return -1;
     }
     Z.handler_installed = 1;
+
+#ifdef __APPLE__
+    const char *keep_exc = getenv("MEMX_KEEP_EXC_PORT");
+    if (!(keep_exc && keep_exc[0] == '1')) {
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS,
+                                 MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+    }
+#endif
 
     Z.running = 1;
     if (pthread_create(&Z.thr, NULL, compressor_main, NULL) != 0) {
