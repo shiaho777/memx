@@ -18,7 +18,7 @@ EMBEDDED_EXAMPLE = $(BUILD_DIR)/embedded_runtime_demo
 CAPSULE_VESSEL = $(BUILD_DIR)/memx_capsule_vessel
 STORED_BIN = $(BUILD_DIR)/memx_stored
 
-.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare test-extensions example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule
+.PHONY: all benchmarks examples clean test capsule-vessel stored explicit-runtime core-test core-sim core-audit posix-adapter test-explicit test-compressing-race test-tensor-codecs test-generic test-capsule-roundtrip test-capsule-segments test-store-service test-python-runtime test-python-bitexact test-weight-archive test-materialize test-python-transformer test-python-torch-transformer test-python-torch-pressure test-python test-memx-array test-memx-kv test-memx-fleet test-memx-session test-capsule-datashare test-extensions example-embedded benchmark-runtime benchmark-stress benchmark-tensor-codecs benchmark-generic benchmark-effective-capacity benchmark-hot-path-latency benchmark-materialize benchmark-capsule ios-build android-build windows-adapter
 
 all: $(RUNTIME_DYLIB) $(CAPSULE_VESSEL)
 
@@ -68,6 +68,21 @@ $(POSIX_TEST_4K): tests/test_posix_adapter.c platform/posix/memx_posix.c platfor
 posix-adapter: $(POSIX_TEST) $(POSIX_TEST_4K)
 	@$(POSIX_TEST)
 	@$(POSIX_TEST_4K)
+
+ios-build:
+	@sh platform/ios/build_ios.sh
+
+android-build:
+	@sh platform/android/build_android.sh
+
+WIN_CC ?= x86_64-w64-mingw32-gcc
+WIN_TEST = $(BUILD_DIR)/test_windows_adapter.exe
+
+windows-adapter: $(WIN_TEST)
+	@echo "built $(WIN_TEST); run on a Windows host or via wine"
+
+$(WIN_TEST): tests/test_windows_adapter.c platform/windows/memx_windows.c platform/windows/memx_windows.h $(CORE_LIB) | $(BUILD_DIR)
+	$(WIN_CC) -O2 -Icore -Iplatform/windows -o $@ tests/test_windows_adapter.c platform/windows/memx_windows.c core/memx_core.c -DMEMX_FORCE_SCALAR
 
 core-audit:
 	@$(CC) $(CFLAGS) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem core/shims -isystem $(CLANG_RESOURCE)/include -c -o $(BUILD_DIR)/memx_core_fs.o core/memx_core.c
